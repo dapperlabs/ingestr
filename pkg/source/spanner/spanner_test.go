@@ -2,9 +2,18 @@ package spanner
 
 import (
 	"encoding/base64"
+	"fmt"
+	"math/big"
+	"reflect"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/civil"
+	"cloud.google.com/go/spanner"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/bruin-data/ingestr/pkg/arrowconv"
 	"github.com/bruin-data/ingestr/pkg/schema"
 	"github.com/bruin-data/ingestr/pkg/source"
 	"github.com/stretchr/testify/assert"
@@ -299,4 +308,247 @@ func TestNewSpannerSource(t *testing.T) {
 	require.NotNil(t, s)
 	assert.Nil(t, s.client)
 	assert.Empty(t, s.dbPath)
+}
+
+// *spanner.Row must satisfy columnGetter, otherwise the seam the tests below
+// rely on would not exist in production.
+var _ columnGetter = (*spanner.Row)(nil)
+
+// stubColumnRow stands in for *spanner.Row, handing out the value registered
+// for a column index without a live Spanner client. It rejects a decode whose
+// destination type does not match the registered value, the same way the real
+// client rejects a destination slice whose element type does not match the
+// column.
+type stubColumnRow struct {
+	values []interface{}
+}
+
+func (s stubColumnRow) Column(idx int, ptr interface{}) error {
+	target := reflect.ValueOf(ptr)
+	if target.Kind() != reflect.Pointer || target.IsNil() {
+		return fmt.Errorf("stubColumnRow: destination for column %d must be a non-nil pointer", idx)
+	}
+	if idx >= len(s.values) {
+		return fmt.Errorf("stubColumnRow: no value registered for column %d", idx)
+	}
+	element := target.Elem()
+	value := s.values[idx]
+	if value == nil {
+		element.Set(reflect.Zero(element.Type()))
+		return nil
+	}
+	source := reflect.ValueOf(value)
+	if !source.Type().AssignableTo(element.Type()) {
+		return fmt.Errorf("stubColumnRow: column %d holds %s, cannot decode into %s", idx, source.Type(), element.Type())
+	}
+	element.Set(source)
+	return nil
+}
+
+func mustRat(t *testing.T, literal string) *big.Rat {
+	t.Helper()
+	rat, ok := new(big.Rat).SetString(literal)
+	require.True(t, ok, "invalid decimal literal %q", literal)
+	return rat
+}
+
+func numericArrayColumn() schema.Column {
+	return schema.Column{
+		Name:      "prices",
+		DataType:  schema.TypeArray,
+		ArrayType: schema.TypeDecimal,
+		Precision: 38,
+		Scale:     9,
+	}
+}
+
+// ARRAY<NUMERIC> values must come out as exact decimals. The literals below
+// cannot survive a float64 round-trip, so a float64 conversion shows up as a
+// changed digit rather than as a passing test.
+func TestExtractColumnValueArrayNumericIsExact(t *testing.T) {
+	row := stubColumnRow{values: []interface{}{
+		[]spanner.NullNumeric{
+			{Numeric: *mustRat(t, "12345678901234.567890123"), Valid: true},
+			{Numeric: *mustRat(t, "0.1"), Valid: true},
+			{Numeric: *mustRat(t, "-0.000000001"), Valid: true},
+			{Numeric: *mustRat(t, "9007199254740993.5"), Valid: true},
+			{Valid: false},
+		},
+	}}
+
+	got, err := extractColumnValue(row, 0, numericArrayColumn())
+	require.NoError(t, err)
+
+	values, ok := got.([]string)
+	require.Truef(t, ok, "ARRAY<NUMERIC> must be carried as exact decimal strings, got %T", got)
+	assert.Equal(t, []string{
+		"12345678901234.567890123",
+		"0.100000000",
+		"-0.000000001",
+		"9007199254740993.500000000",
+	}, values)
+}
+
+// The exact decimals must survive the Arrow conversion the reader actually
+// performs, not only the type switch.
+func TestArrayNumericSurvivesArrowBatchConversion(t *testing.T) {
+	col := numericArrayColumn()
+	arrowSchema := buildArrowSchema([]schema.Column{col})
+	require.Equal(t, arrow.ListOf(&arrow.Decimal128Type{Precision: 38, Scale: 9}), arrowSchema.Field(0).Type)
+
+	row := stubColumnRow{values: []interface{}{
+		[]spanner.NullNumeric{
+			{Numeric: *mustRat(t, "12345678901234.567890123"), Valid: true},
+			{Numeric: *mustRat(t, "-0.000000001"), Valid: true},
+			{Valid: false},
+		},
+	}}
+
+	value, err := extractColumnValue(row, 0, col)
+	require.NoError(t, err)
+
+	builder := array.NewBuilder(memory.NewGoAllocator(), arrowSchema.Field(0).Type)
+	defer builder.Release()
+	arrowconv.AppendValue(builder, value)
+
+	list, ok := builder.NewArray().(*array.List)
+	require.True(t, ok)
+	defer list.Release()
+	require.Equal(t, 1, list.Len())
+	require.False(t, list.IsNull(0))
+
+	decimals, ok := list.ListValues().(*array.Decimal128)
+	require.True(t, ok)
+	require.Equal(t, 2, decimals.Len())
+
+	assert.Equal(t, "12345678901234.567890123", decimals.Value(0).ToString(9))
+	assert.Equal(t, "-0.000000001", decimals.Value(1).ToString(9))
+}
+
+// Every element type the Spanner client can report for an array must be
+// converted rather than silently dropped.
+func TestExtractColumnValueArrayElementTypes(t *testing.T) {
+	timestamp := time.Date(2026, time.October, 20, 13, 45, 30, 123456000, time.UTC)
+	day := civil.Date{Year: 2026, Month: time.October, Day: 20}
+
+	tests := []struct {
+		name      string
+		arrayType schema.DataType
+		value     interface{}
+		want      interface{}
+	}{
+		{
+			name:      "string",
+			arrayType: schema.TypeString,
+			value:     []spanner.NullString{{StringVal: "a", Valid: true}, {Valid: false}, {StringVal: "b", Valid: true}},
+			want:      []string{"a", "b"},
+		},
+		{
+			name:      "int64",
+			arrayType: schema.TypeInt64,
+			value:     []spanner.NullInt64{{Int64: 7, Valid: true}},
+			want:      []int64{7},
+		},
+		{
+			name:      "float32",
+			arrayType: schema.TypeFloat32,
+			value:     []spanner.NullFloat32{{Float32: 1.5, Valid: true}},
+			want:      []float32{1.5},
+		},
+		{
+			name:      "float64",
+			arrayType: schema.TypeFloat64,
+			value:     []spanner.NullFloat64{{Float64: 2.25, Valid: true}},
+			want:      []float64{2.25},
+		},
+		{
+			name:      "boolean",
+			arrayType: schema.TypeBoolean,
+			value:     []spanner.NullBool{{Bool: true, Valid: true}},
+			want:      []bool{true},
+		},
+		{
+			name:      "date",
+			arrayType: schema.TypeDate,
+			value:     []spanner.NullDate{{Date: day, Valid: true}},
+			want:      []time.Time{time.Date(2026, time.October, 20, 0, 0, 0, 0, time.UTC)},
+		},
+		{
+			name:      "timestamp",
+			arrayType: schema.TypeTimestampTZ,
+			value:     []spanner.NullTime{{Time: timestamp, Valid: true}},
+			want:      []time.Time{timestamp},
+		},
+		{
+			name:      "bytes",
+			arrayType: schema.TypeBinary,
+			value:     [][]byte{[]byte("ab")},
+			want:      [][]byte{[]byte("ab")},
+		},
+		{
+			name:      "json",
+			arrayType: schema.TypeJSON,
+			value:     []spanner.NullJSON{{Value: map[string]interface{}{"a": float64(1)}, Valid: true}},
+			want:      []string{`{"a":1}`},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			col := schema.Column{Name: "items", DataType: schema.TypeArray, ArrayType: test.arrayType}
+			row := stubColumnRow{values: []interface{}{test.value}}
+
+			got, err := extractColumnValue(row, 0, col)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+// An array element type that cannot be represented must fail the read. The
+// previous behaviour returned NULL, which loses the column without a trace.
+func TestExtractColumnValueUnsupportedArrayElementErrors(t *testing.T) {
+	for _, arrayType := range []schema.DataType{schema.TypeTime, schema.TypeInterval, schema.TypeArray, schema.TypeUnknown} {
+		t.Run(arrayType.String(), func(t *testing.T) {
+			col := schema.Column{Name: "unsupported", DataType: schema.TypeArray, ArrayType: arrayType}
+			row := stubColumnRow{values: []interface{}{[]spanner.NullString{{StringVal: "x", Valid: true}}}}
+
+			got, err := extractColumnValue(row, 0, col)
+			require.Error(t, err)
+			assert.Nil(t, got)
+			assert.Contains(t, err.Error(), `"unsupported"`)
+			assert.Contains(t, err.Error(), arrayType.String())
+		})
+	}
+}
+
+// A decode failure on an array column is reported, not turned into a NULL.
+func TestExtractColumnValueArrayDecodeFailureIsReported(t *testing.T) {
+	col := numericArrayColumn()
+	// A decimal array decoded as strings is exactly the mismatch that used to
+	// produce a silent NULL.
+	row := stubColumnRow{values: []interface{}{[]spanner.NullString{{StringVal: "1", Valid: true}}}}
+
+	got, err := extractColumnValue(row, 0, col)
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), `"prices"`)
+}
+
+func TestArrayValuesDropsNullElements(t *testing.T) {
+	col := schema.Column{Name: "tags", DataType: schema.TypeArray, ArrayType: schema.TypeString}
+	row := stubColumnRow{values: []interface{}{[]spanner.NullString{{Valid: false}, {Valid: false}}}}
+
+	got, err := extractColumnValue(row, 0, col)
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, got)
+}
+
+func TestArrayValuesNilSliceStaysNull(t *testing.T) {
+	col := schema.Column{Name: "tags", DataType: schema.TypeArray, ArrayType: schema.TypeString}
+	row := stubColumnRow{values: []interface{}{[]spanner.NullString(nil)}}
+
+	got, err := extractColumnValue(row, 0, col)
+	require.NoError(t, err)
+	assert.Nil(t, got)
 }
