@@ -52,7 +52,7 @@ func TestArrowCopyReaderTypedListValues(t *testing.T) {
 			t.Errorf("fallback row %d = %x, want %x", row, gotBytes, wantBytes)
 		}
 	}
-	reader, ok := newArrowCopyReader(record, nil, typeMap, []uint32{pgtype.Int8ArrayOID})
+	reader, ok := newArrowCopyReader(record, nil, typeMap, []uint32{pgtype.Int8ArrayOID}, []int{0})
 	if !ok {
 		t.Fatal("typed list rejected by COPY reader")
 	}
@@ -126,7 +126,7 @@ func TestArrowCopyReaderMatchesPGXBinaryEncoding(t *testing.T) {
 		pgtype.JSONBOID,
 	}
 	typeMap := pgtype.NewMap()
-	reader, ok := newArrowCopyReader(record, nil, typeMap, oids)
+	reader, ok := newArrowCopyReader(record, nil, typeMap, oids, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
 	if !ok {
 		t.Fatal("newArrowCopyReader rejected built-in PostgreSQL types")
 	}
@@ -258,13 +258,13 @@ func TestArrowCopyReaderHandlesRowsLargerThanReadBuffer(t *testing.T) {
 	)
 	defer record.Release()
 
-	smallBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID})
+	smallBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID}, []int{0})
 	if !ok {
 		t.Fatal("newArrowCopyReader rejected string record")
 	}
 	want := readAllWithBuffer(t, smallBufferReader, 4*1024)
 
-	directBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID})
+	directBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID}, []int{0})
 	if !ok {
 		t.Fatal("newArrowCopyReader rejected string record")
 	}

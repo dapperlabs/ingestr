@@ -352,11 +352,11 @@ func TestPostgresCopyPlanCacheReusesDescriptionForRecordSchema(t *testing.T) {
 	}
 	cache := make(postgresCopyPlanCache)
 
-	first, err := cache.get(t.Context(), describer, record, "analytics.events")
+	first, err := cache.get(t.Context(), describer, record, "analytics.events", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := cache.get(t.Context(), describer, record, "analytics.events")
+	second, err := cache.get(t.Context(), describer, record, "analytics.events", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

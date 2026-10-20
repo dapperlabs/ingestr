@@ -32,7 +32,7 @@ func TestPostgresRecordCopyStreamMatchesSingleRecordEncoding(t *testing.T) {
 	records <- source.RecordBatchResult{Batch: second}
 	close(records)
 
-	stream, err := newPostgresRecordCopyStream(t.Context(), records, first, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID})
+	stream, err := newPostgresRecordCopyStream(t.Context(), records, first, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID}, []int{0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestPostgresRecordCopyStreamMatchesSingleRecordEncoding(t *testing.T) {
 
 	combined := int32Record(t, 1, 2, 3, 4)
 	defer combined.Release()
-	reader, ok := newArrowCopyReader(combined, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID})
+	reader, ok := newArrowCopyReader(combined, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID}, []int{0})
 	if !ok {
 		t.Fatal("combined record did not support direct PostgreSQL COPY")
 	}
@@ -68,7 +68,7 @@ func TestPostgresRecordCopyStreamReleasesConsumedRecords(t *testing.T) {
 	records <- source.RecordBatchResult{Batch: second}
 	close(records)
 
-	stream, err := newPostgresRecordCopyStream(t.Context(), records, first, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID})
+	stream, err := newPostgresRecordCopyStream(t.Context(), records, first, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID}, []int{0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestPostgresRecordCopyStreamDefersSourceErrorUntilCopyBoundary(t *testing.T
 	records <- source.RecordBatchResult{Err: sourceErr}
 	close(records)
 
-	stream, err := newPostgresRecordCopyStream(t.Context(), records, first, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID})
+	stream, err := newPostgresRecordCopyStream(t.Context(), records, first, int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID}, []int{0})
 	if err != nil {
 		t.Fatal(err)
 	}
