@@ -403,7 +403,13 @@ func (s *SpannerSource) rowsToArrowBatch(iter *spanner.RowIterator, arrowSchema 
 		}
 
 		for i := range columns {
-			val := extractColumnValue(row, i, columns[i])
+			val, err := extractColumnValue(row, i, columns[i])
+			if err != nil {
+				for _, b := range builders {
+					b.Release()
+				}
+				return nil, 0, err
+			}
 			arrowconv.AppendValue(builders[i], val)
 			if maxBatchBytes > 0 {
 				accBytes += arrowconv.ValueBytes(val)
@@ -440,150 +446,190 @@ func (s *SpannerSource) rowsToArrowBatch(iter *spanner.RowIterator, arrowSchema 
 	return record, rowCount, nil
 }
 
-func extractColumnValue(row *spanner.Row, idx int, col schema.Column) interface{} {
+// columnGetter decodes the value of result column idx into ptr. *spanner.Row
+// implements it; tests substitute their own implementation.
+type columnGetter interface {
+	Column(idx int, ptr interface{}) error
+}
+
+// spannerNumericScale is the scale Spanner reports for NUMERIC, see
+// MapSpannerCodeToDataType. Scalar and array NUMERIC columns are rendered with
+// this many fractional digits so a value never changes on the way out.
+const spannerNumericScale = 9
+
+// arrayValues decodes an ARRAY column into a slice of converted elements,
+// skipping SQL NULL elements. Every supported array element type shares this
+// shape, and a decode failure is returned as an error: the Spanner client
+// rejects a destination slice whose element type does not match the column, and
+// that rejection must never be reported as a NULL column.
+func arrayValues[V any, E any](row columnGetter, idx int, col schema.Column, convert func(V) (E, bool)) ([]E, error) {
+	var v []V
+	if err := row.Column(idx, &v); err != nil {
+		return nil, fmt.Errorf("failed to read ARRAY<%s> column %q: %w", col.ArrayType, col.Name, err)
+	}
+	if v == nil {
+		return nil, nil
+	}
+	result := make([]E, 0, len(v))
+	for _, element := range v {
+		value, ok := convert(element)
+		if !ok {
+			continue
+		}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func extractColumnValue(row columnGetter, idx int, col schema.Column) (interface{}, error) {
 	switch col.DataType {
 	case schema.TypeBoolean:
 		var v spanner.NullBool
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Bool
+		return v.Bool, nil
 	case schema.TypeInt64:
 		var v spanner.NullInt64
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Int64
+		return v.Int64, nil
 	case schema.TypeFloat32:
 		var v spanner.NullFloat32
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Float32
+		return v.Float32, nil
 	case schema.TypeFloat64:
 		var v spanner.NullFloat64
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Float64
+		return v.Float64, nil
 	case schema.TypeString:
 		var v spanner.NullString
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.StringVal
+		return v.StringVal, nil
 	case schema.TypeBinary:
 		var v []byte
 		if err := row.Column(idx, &v); err != nil {
-			return nil
+			return nil, nil
 		}
 		if v == nil {
-			return nil
+			return nil, nil
 		}
-		return v
+		return v, nil
 	case schema.TypeDate:
 		var v spanner.NullDate
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Date.In(time.UTC)
+		return v.Date.In(time.UTC), nil
 	case schema.TypeTimestampTZ, schema.TypeTimestamp:
 		var v spanner.NullTime
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Time
+		return v.Time, nil
 	case schema.TypeDecimal:
 		var v spanner.NullNumeric
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.Numeric.FloatString(9)
+		return v.Numeric.FloatString(spannerNumericScale), nil
 	case schema.TypeJSON:
 		var v spanner.NullJSON
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
 		jsonBytes, err := json.Marshal(v.Value)
 		if err != nil {
-			return fmt.Sprintf("%v", v.Value)
+			return fmt.Sprintf("%v", v.Value), nil
 		}
-		return string(jsonBytes)
+		return string(jsonBytes), nil
 	case schema.TypeUUID:
 		var v spanner.NullString
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.StringVal
+		return v.StringVal, nil
 	case schema.TypeArray:
-		switch col.ArrayType {
-		case schema.TypeString:
-			var v []spanner.NullString
-			if err := row.Column(idx, &v); err != nil || v == nil {
-				return nil
-			}
-			result := make([]string, 0, len(v))
-			for _, s := range v {
-				if s.Valid {
-					result = append(result, s.StringVal)
-				}
-			}
-			return result
-		case schema.TypeInt64:
-			var v []spanner.NullInt64
-			if err := row.Column(idx, &v); err != nil || v == nil {
-				return nil
-			}
-			result := make([]int64, 0, len(v))
-			for _, n := range v {
-				if n.Valid {
-					result = append(result, n.Int64)
-				}
-			}
-			return result
-		case schema.TypeFloat64:
-			var v []spanner.NullFloat64
-			if err := row.Column(idx, &v); err != nil || v == nil {
-				return nil
-			}
-			result := make([]float64, 0, len(v))
-			for _, n := range v {
-				if n.Valid {
-					result = append(result, n.Float64)
-				}
-			}
-			return result
-		case schema.TypeBoolean:
-			var v []spanner.NullBool
-			if err := row.Column(idx, &v); err != nil || v == nil {
-				return nil
-			}
-			result := make([]bool, 0, len(v))
-			for _, b := range v {
-				if b.Valid {
-					result = append(result, b.Bool)
-				}
-			}
-			return result
-		default:
-			var v []spanner.NullString
-			if err := row.Column(idx, &v); err != nil || v == nil {
-				return nil
-			}
-			result := make([]string, 0, len(v))
-			for _, s := range v {
-				if s.Valid {
-					result = append(result, s.StringVal)
-				}
-			}
-			return result
-		}
+		return extractArrayValue(row, idx, col)
 	default:
 		var v spanner.NullString
 		if err := row.Column(idx, &v); err != nil || !v.Valid {
-			return nil
+			return nil, nil
 		}
-		return v.StringVal
+		return v.StringVal, nil
+	}
+}
+
+// extractArrayValue converts an ARRAY column. Every element type Spanner
+// reports is handled explicitly, and an element type this function cannot
+// represent is an error rather than a NULL column: returning NULL here drops
+// the caller's data without telling anyone.
+func extractArrayValue(row columnGetter, idx int, col schema.Column) (interface{}, error) {
+	switch col.ArrayType {
+	case schema.TypeString:
+		return arrayValues(row, idx, col, func(s spanner.NullString) (string, bool) {
+			return s.StringVal, s.Valid
+		})
+	case schema.TypeInt64:
+		return arrayValues(row, idx, col, func(n spanner.NullInt64) (int64, bool) {
+			return n.Int64, n.Valid
+		})
+	case schema.TypeFloat32:
+		return arrayValues(row, idx, col, func(n spanner.NullFloat32) (float32, bool) {
+			return n.Float32, n.Valid
+		})
+	case schema.TypeFloat64:
+		return arrayValues(row, idx, col, func(n spanner.NullFloat64) (float64, bool) {
+			return n.Float64, n.Valid
+		})
+	case schema.TypeBoolean:
+		return arrayValues(row, idx, col, func(b spanner.NullBool) (bool, bool) {
+			return b.Bool, b.Valid
+		})
+	case schema.TypeDecimal:
+		// NUMERIC keeps its exact decimal form; a float64 round-trip would
+		// lose digits that matter for money.
+		return arrayValues(row, idx, col, func(n spanner.NullNumeric) (string, bool) {
+			if !n.Valid {
+				return "", false
+			}
+			return n.Numeric.FloatString(spannerNumericScale), true
+		})
+	case schema.TypeDate:
+		return arrayValues(row, idx, col, func(d spanner.NullDate) (time.Time, bool) {
+			if !d.Valid {
+				return time.Time{}, false
+			}
+			return d.Date.In(time.UTC), true
+		})
+	case schema.TypeTimestamp, schema.TypeTimestampTZ:
+		return arrayValues(row, idx, col, func(t spanner.NullTime) (time.Time, bool) {
+			return t.Time, t.Valid
+		})
+	case schema.TypeBinary:
+		return arrayValues(row, idx, col, func(b []byte) ([]byte, bool) {
+			return b, b != nil
+		})
+	case schema.TypeJSON:
+		return arrayValues(row, idx, col, func(j spanner.NullJSON) (string, bool) {
+			if !j.Valid {
+				return "", false
+			}
+			jsonBytes, err := json.Marshal(j.Value)
+			if err != nil {
+				return fmt.Sprintf("%v", j.Value), true
+			}
+			return string(jsonBytes), true
+		})
+	default:
+		return nil, fmt.Errorf("cannot convert column %q to an Arrow value: unsupported Spanner array element type %s", col.Name, col.ArrayType)
 	}
 }
 
@@ -644,15 +690,19 @@ func (s *SpannerSource) ExecuteCustomQuery(ctx context.Context, query string, op
 
 		var rowCount int64
 		var accBytes int64
-		appendRow := func(row *spanner.Row) {
+		appendRow := func(row *spanner.Row) error {
 			for i := range columns {
-				val := extractColumnValue(row, i, columns[i])
+				val, err := extractColumnValue(row, i, columns[i])
+				if err != nil {
+					return err
+				}
 				arrowconv.AppendValue(builders[i], val)
 				if opts.MaxBatchBytes > 0 {
 					accBytes += arrowconv.ValueBytes(val)
 				}
 			}
 			rowCount++
+			return nil
 		}
 		shouldFlush := func() bool {
 			return rowCount >= int64(batchSize) || (opts.MaxBatchBytes > 0 && accBytes >= opts.MaxBatchBytes)
@@ -676,7 +726,10 @@ func (s *SpannerSource) ExecuteCustomQuery(ctx context.Context, query string, op
 			accBytes = 0
 		}
 
-		appendRow(firstRow)
+		if err := appendRow(firstRow); err != nil {
+			results <- source.RecordBatchResult{Err: err}
+			return
+		}
 		if shouldFlush() {
 			flush()
 		}
@@ -691,7 +744,10 @@ func (s *SpannerSource) ExecuteCustomQuery(ctx context.Context, query string, op
 				return
 			}
 
-			appendRow(row)
+			if err := appendRow(row); err != nil {
+				results <- source.RecordBatchResult{Err: err}
+				return
+			}
 			if shouldFlush() {
 				flush()
 			}

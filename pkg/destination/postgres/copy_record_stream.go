@@ -17,6 +17,7 @@ type postgresRecordCopyStream struct {
 	tableSchema    *schema.TableSchema
 	typeMap        *pgtype.Map
 	oids           []uint32
+	sourceColumns  []int
 	recordSchema   *arrow.Schema
 	current        *arrowCopyReader
 	currentRecord  arrow.RecordBatch
@@ -27,14 +28,15 @@ type postgresRecordCopyStream struct {
 	batches        int
 }
 
-func newPostgresRecordCopyStream(ctx context.Context, records <-chan source.RecordBatchResult, first arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32) (*postgresRecordCopyStream, error) {
+func newPostgresRecordCopyStream(ctx context.Context, records <-chan source.RecordBatchResult, first arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, sourceColumns []int) (*postgresRecordCopyStream, error) {
 	stream := &postgresRecordCopyStream{
-		ctx:          ctx,
-		records:      records,
-		tableSchema:  tableSchema,
-		typeMap:      typeMap,
-		oids:         oids,
-		recordSchema: first.Schema(),
+		ctx:           ctx,
+		records:       records,
+		tableSchema:   tableSchema,
+		typeMap:       typeMap,
+		oids:          oids,
+		sourceColumns: sourceColumns,
+		recordSchema:  first.Schema(),
 	}
 	if err := stream.setRecord(first); err != nil {
 		return nil, err
@@ -42,12 +44,12 @@ func newPostgresRecordCopyStream(ctx context.Context, records <-chan source.Reco
 	return stream, nil
 }
 
-func recordSupportsDirectPostgresCopy(record arrow.RecordBatch, oids []uint32) bool {
-	if len(oids) != int(record.NumCols()) {
+func recordSupportsDirectPostgresCopy(record arrow.RecordBatch, plan *postgresCopyPlan) bool {
+	if len(plan.oids) != len(plan.sourceColumns) {
 		return false
 	}
-	for column := 0; column < int(record.NumCols()); column++ {
-		if _, ok := directArrowCopyColumn(record.Column(column), oids[column]); !ok {
+	for i, source := range plan.sourceColumns {
+		if _, ok := directArrowCopyColumn(record.Column(source), plan.oids[i]); !ok {
 			return false
 		}
 	}
@@ -142,7 +144,7 @@ func (s *postgresRecordCopyStream) nextRecord() error {
 }
 
 func (s *postgresRecordCopyStream) setRecord(record arrow.RecordBatch) error {
-	reader, ok := newArrowCopyReaderWithBoundaries(record, s.tableSchema, s.typeMap, s.oids, false, false)
+	reader, ok := newArrowCopyReaderWithBoundaries(record, s.tableSchema, s.typeMap, s.oids, s.sourceColumns, false, false)
 	if !ok {
 		record.Release()
 		return fmt.Errorf("record schema no longer supports direct PostgreSQL COPY")

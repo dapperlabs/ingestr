@@ -31,26 +31,26 @@ type arrowCopyReader struct {
 
 type arrowCopyColumn func(int, []byte) ([]byte, bool, error)
 
-func newArrowCopyReader(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32) (*arrowCopyReader, bool) {
-	return newArrowCopyReaderWithBoundaries(record, tableSchema, typeMap, oids, true, true)
+func newArrowCopyReader(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, sourceColumns []int) (*arrowCopyReader, bool) {
+	return newArrowCopyReaderWithBoundaries(record, tableSchema, typeMap, oids, sourceColumns, true, true)
 }
 
-func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, includeHeader, includeTrailer bool) (*arrowCopyReader, bool) {
-	if len(oids) != int(record.NumCols()) {
+func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, sourceColumns []int, includeHeader, includeTrailer bool) (*arrowCopyReader, bool) {
+	if len(oids) != len(sourceColumns) {
 		return nil, false
 	}
 
-	columns := make([]arrowCopyColumn, record.NumCols())
+	columns := make([]arrowCopyColumn, len(sourceColumns))
 	var columnTypes map[string]schema.DataType
-	for column := range columns {
-		if direct, ok := directArrowCopyColumn(record.Column(column), oids[column]); ok {
-			columns[column] = direct
+	for i, source := range sourceColumns {
+		if direct, ok := directArrowCopyColumn(record.Column(source), oids[i]); ok {
+			columns[i] = direct
 			continue
 		}
 		if columnTypes == nil {
 			columnTypes = postgresColumnTypesByName(tableSchema)
 		}
-		get := postgresValueGetterForType(record.Column(column), columnTypes[record.ColumnName(column)])
+		get := postgresValueGetterForType(record.Column(source), columnTypes[record.ColumnName(source)])
 
 		var plan pgtype.EncodePlan
 		for row := 0; row < int(record.NumRows()); row++ {
@@ -59,7 +59,7 @@ func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *sch
 				continue
 			}
 
-			plan = typeMap.PlanEncode(oids[column], pgx.BinaryFormatCode, value)
+			plan = typeMap.PlanEncode(oids[i], pgx.BinaryFormatCode, value)
 			if plan == nil {
 				return nil, false
 			}
@@ -68,7 +68,7 @@ func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *sch
 			}
 			break
 		}
-		columns[column] = func(row int, dst []byte) ([]byte, bool, error) {
+		columns[i] = func(row int, dst []byte) ([]byte, bool, error) {
 			value := get(row)
 			if value == nil {
 				return dst, true, nil
