@@ -1,5 +1,6 @@
 # Builds the migration image on a native amd64 runner (CGO on — the stock
-# Dockerfile) and pushes to the staging account's ECR.
+# Dockerfile) and pushes to dl-atlas-common's ECR — the shared artifact
+# registry (atlas-common is the estate's shared-services account).
 #
 # Why a workflow: the stock build needs CGO_ENABLED=1 (the spanner source drops
 # out of the CLI registry without it — proven locally) and the QEMU-emulated
@@ -23,7 +24,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::908768512294:role/github-ingestr-ecr-push
+          role-to-assume: arn:aws:iam::719623058985:role/github-ingestr-ecr-push
           aws-region: us-west-2
 
       - name: Log in to ECR
@@ -34,4 +35,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: 908768512294.dkr.ecr.us-west-2.amazonaws.com/ingestr:dapper-fix-${{ github.run_id }}
+          tags: 719623058985.dkr.ecr.us-west-2.amazonaws.com/ingestr:dapper-fix-${{ github.run_id }}
