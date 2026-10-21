@@ -108,11 +108,29 @@ func (s *SpannerSource) getSchema(ctx context.Context, table string) (*schema.Ta
 	if err != nil {
 		return nil, err
 	}
-	if columns == nil {
-		columns, err = s.getSchemaFromInfoSchema(ctx, table)
-		if err != nil {
-			return nil, err
+	// The query path derives types from result-set metadata, which carries no
+	// declared lengths — STRING(255) arrives unbounded and the evolution
+	// comparator reads it as widen-to-TEXT against varchar(255) destinations
+	// (the staging copy's freeze failure). INFORMATION_SCHEMA always carries
+	// the declared shape, so lengths (and anything else only it knows) merge
+	// in regardless of which path produced the column list.
+	infoColumns, infoErr := s.getSchemaFromInfoSchema(ctx, table)
+	if infoErr != nil && columns == nil {
+		return nil, infoErr
+	}
+	if infoErr == nil {
+		byName := make(map[string]schema.Column, len(infoColumns))
+		for _, c := range infoColumns {
+			byName[c.Name] = c
 		}
+		for i := range columns {
+			if info, ok := byName[columns[i].Name]; ok {
+				columns[i].MaxLength = info.MaxLength
+			}
+		}
+	}
+	if columns == nil {
+		columns = infoColumns
 	}
 
 	primaryKeys := s.fetchPrimaryKeys(ctx, table)
