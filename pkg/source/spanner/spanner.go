@@ -462,7 +462,12 @@ const spannerNumericScale = 9
 // shape, and a decode failure is returned as an error: the Spanner client
 // rejects a destination slice whose element type does not match the column, and
 // that rejection must never be reported as a NULL column.
-func arrayValues[V any, E any](row columnGetter, idx int, col schema.Column, convert func(V) (E, bool)) ([]E, error) {
+// The return is `any`, not []E: a typed nil slice boxed into interface{} is
+// non-nil, so arrowconv.AppendValue would take the append path and write an
+// empty list where Spanner said NULL. NULL and empty are different facts
+// ("not configured" vs "configured empty"); every element-type case funnels
+// through here, so the boundary is the one place that must get this right.
+func arrayValues[V any, E any](row columnGetter, idx int, col schema.Column, convert func(V) (E, bool)) (any, error) {
 	var v []V
 	if err := row.Column(idx, &v); err != nil {
 		return nil, fmt.Errorf("failed to read ARRAY<%s> column %q: %w", col.ArrayType, col.Name, err)
