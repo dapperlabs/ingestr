@@ -388,8 +388,18 @@ func sameColumnTypeShape(a, b schema.Column) bool {
 	}
 	switch a.DataType {
 	case schema.TypeDecimal:
+		// An unbounded destination (pg numeric reports 0) accepts any
+		// precision the source declares.
+		if b.Precision == 0 {
+			return true
+		}
 		return a.Precision == b.Precision && a.Scale == b.Scale
 	case schema.TypeString:
+		// Same for length: pg text reports 0, and Spanner STRING(255) into
+		// text is not drift — every value the source can hold fits.
+		if b.MaxLength == 0 {
+			return true
+		}
 		return a.MaxLength == b.MaxLength
 	case schema.TypeArray:
 		if a.ArrayType != b.ArrayType {
@@ -397,8 +407,14 @@ func sameColumnTypeShape(a, b schema.Column) bool {
 		}
 		switch a.ArrayType {
 		case schema.TypeDecimal:
+			if b.Precision == 0 {
+				return true
+			}
 			return a.Precision == b.Precision && a.Scale == b.Scale
 		case schema.TypeString:
+			if b.MaxLength == 0 {
+				return true
+			}
 			return a.MaxLength == b.MaxLength
 		}
 	}

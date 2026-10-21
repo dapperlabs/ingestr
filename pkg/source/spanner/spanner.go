@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"log"
 	"net/url"
 	"strings"
@@ -199,13 +200,14 @@ func (s *SpannerSource) getSchemaFromInfoSchema(ctx context.Context, table strin
 			return nil, fmt.Errorf("failed to read column info: %w", err)
 		}
 
-		dt, precision, scale, arrayType := mapSpannerTypeString(spannerType)
+		dt, precision, scale, maxLength, arrayType := mapSpannerTypeString(spannerType)
 		columns = append(columns, schema.Column{
 			Name:      colName,
 			DataType:  dt,
 			Nullable:  isNullable == "YES",
 			Precision: precision,
 			Scale:     scale,
+			MaxLength: maxLength,
 			ArrayType: arrayType,
 		})
 	}
@@ -216,43 +218,56 @@ func (s *SpannerSource) getSchemaFromInfoSchema(ctx context.Context, table strin
 	return columns, nil
 }
 
-func mapSpannerTypeString(spannerType string) (schema.DataType, int, int, schema.DataType) {
+// Returns (type, precision, scale, maxLength, arrayElementType). maxLength is
+// the declared STRING(n)/BYTES(n) bound — 0 for MAX/unbounded. It matters:
+// the schema-evolution comparator shapes strings by length, and dropping the
+// bound made Spanner STRING(255) read as "unbounded" against a varchar(255)
+// destination, producing phantom drift (and, under evolve, a no-op ALTER that
+// Postgres forbids on generated-column inputs).
+func mapSpannerTypeString(spannerType string) (schema.DataType, int, int, int, schema.DataType) {
 	upper := strings.ToUpper(strings.TrimSpace(spannerType))
 
 	if strings.HasPrefix(upper, "ARRAY<") {
 		inner := upper[6 : len(upper)-1]
-		elemType, precision, scale, _ := mapSpannerTypeString(inner)
-		return schema.TypeArray, precision, scale, elemType
+		elemType, precision, scale, elemLen, _ := mapSpannerTypeString(inner)
+		return schema.TypeArray, precision, scale, elemLen, elemType
 	}
 
 	base := upper
+	maxLength := 0
 	if idx := strings.Index(upper, "("); idx != -1 {
 		base = upper[:idx]
+		size := upper[idx+1 : len(upper)-1]
+		if size != "MAX" {
+			if n, err := strconv.Atoi(size); err == nil {
+				maxLength = n
+			}
+		}
 	}
 
 	switch base {
 	case "BOOL":
-		return schema.TypeBoolean, 0, 0, schema.TypeUnknown
+		return schema.TypeBoolean, 0, 0, 0, schema.TypeUnknown
 	case "INT64":
-		return schema.TypeInt64, 0, 0, schema.TypeUnknown
+		return schema.TypeInt64, 0, 0, 0, schema.TypeUnknown
 	case "FLOAT32":
-		return schema.TypeFloat32, 0, 0, schema.TypeUnknown
+		return schema.TypeFloat32, 0, 0, 0, schema.TypeUnknown
 	case "FLOAT64":
-		return schema.TypeFloat64, 0, 0, schema.TypeUnknown
+		return schema.TypeFloat64, 0, 0, 0, schema.TypeUnknown
 	case "NUMERIC":
-		return schema.TypeDecimal, 38, 9, schema.TypeUnknown
+		return schema.TypeDecimal, 38, 9, 0, schema.TypeUnknown
 	case "STRING":
-		return schema.TypeString, 0, 0, schema.TypeUnknown
+		return schema.TypeString, 0, 0, maxLength, schema.TypeUnknown
 	case "BYTES":
-		return schema.TypeBinary, 0, 0, schema.TypeUnknown
+		return schema.TypeBinary, 0, 0, maxLength, schema.TypeUnknown
 	case "DATE":
-		return schema.TypeDate, 0, 0, schema.TypeUnknown
+		return schema.TypeDate, 0, 0, 0, schema.TypeUnknown
 	case "TIMESTAMP":
-		return schema.TypeTimestampTZ, 0, 0, schema.TypeUnknown
+		return schema.TypeTimestampTZ, 0, 0, 0, schema.TypeUnknown
 	case "JSON":
-		return schema.TypeJSON, 0, 0, schema.TypeUnknown
+		return schema.TypeJSON, 0, 0, 0, schema.TypeUnknown
 	default:
-		return schema.TypeString, 0, 0, schema.TypeUnknown
+		return schema.TypeString, 0, 0, 0, schema.TypeUnknown
 	}
 }
 
