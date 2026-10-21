@@ -43,7 +43,7 @@ func TestParseURI(t *testing.T) {
 		},
 		{
 			name:       "valid URI with credentials_path",
-			uri:        "spanner://?project_id=proj&instance_id=inst&database=db&credentials_path="+credsFile+"",
+			uri:        "spanner://?project_id=proj&instance_id=inst&database=db&credentials_path=" + credsFile + "",
 			wantDBPath: "projects/proj/instances/inst/databases/db",
 		},
 		{
@@ -107,32 +107,35 @@ func TestMapSpannerTypeString(t *testing.T) {
 		wantType  schema.DataType
 		wantPrec  int
 		wantScale int
+		wantLen   int
 		wantArray schema.DataType
 	}{
-		{"BOOL", "BOOL", schema.TypeBoolean, 0, 0, schema.TypeUnknown},
-		{"INT64", "INT64", schema.TypeInt64, 0, 0, schema.TypeUnknown},
-		{"FLOAT32", "FLOAT32", schema.TypeFloat32, 0, 0, schema.TypeUnknown},
-		{"FLOAT64", "FLOAT64", schema.TypeFloat64, 0, 0, schema.TypeUnknown},
-		{"NUMERIC", "NUMERIC", schema.TypeDecimal, 38, 9, schema.TypeUnknown},
-		{"STRING", "STRING(MAX)", schema.TypeString, 0, 0, schema.TypeUnknown},
-		{"STRING with length", "STRING(255)", schema.TypeString, 0, 0, schema.TypeUnknown},
-		{"BYTES", "BYTES(MAX)", schema.TypeBinary, 0, 0, schema.TypeUnknown},
-		{"DATE", "DATE", schema.TypeDate, 0, 0, schema.TypeUnknown},
-		{"TIMESTAMP", "TIMESTAMP", schema.TypeTimestampTZ, 0, 0, schema.TypeUnknown},
-		{"JSON", "JSON", schema.TypeJSON, 0, 0, schema.TypeUnknown},
-		{"ARRAY<STRING>", "ARRAY<STRING(MAX)>", schema.TypeArray, 0, 0, schema.TypeString},
-		{"ARRAY<INT64>", "ARRAY<INT64>", schema.TypeArray, 0, 0, schema.TypeInt64},
-		{"ARRAY<FLOAT64>", "ARRAY<FLOAT64>", schema.TypeArray, 0, 0, schema.TypeFloat64},
-		{"ARRAY<BOOL>", "ARRAY<BOOL>", schema.TypeArray, 0, 0, schema.TypeBoolean},
-		{"lowercase", "bool", schema.TypeBoolean, 0, 0, schema.TypeUnknown},
-		{"mixed case", "String(MAX)", schema.TypeString, 0, 0, schema.TypeUnknown},
-		{"unknown type", "PROTO", schema.TypeString, 0, 0, schema.TypeUnknown},
+		{"BOOL", "BOOL", schema.TypeBoolean, 0, 0, 0, schema.TypeUnknown},
+		{"INT64", "INT64", schema.TypeInt64, 0, 0, 0, schema.TypeUnknown},
+		{"FLOAT32", "FLOAT32", schema.TypeFloat32, 0, 0, 0, schema.TypeUnknown},
+		{"FLOAT64", "FLOAT64", schema.TypeFloat64, 0, 0, 0, schema.TypeUnknown},
+		{"NUMERIC", "NUMERIC", schema.TypeDecimal, 38, 9, 0, schema.TypeUnknown},
+		{"STRING", "STRING(MAX)", schema.TypeString, 0, 0, 0, schema.TypeUnknown},
+		{"STRING with length", "STRING(255)", schema.TypeString, 0, 0, 255, schema.TypeUnknown},
+		{"BYTES with length", "BYTES(64)", schema.TypeBinary, 0, 0, 64, schema.TypeUnknown},
+		{"DATE", "DATE", schema.TypeDate, 0, 0, 0, schema.TypeUnknown},
+		{"TIMESTAMP", "TIMESTAMP", schema.TypeTimestampTZ, 0, 0, 0, schema.TypeUnknown},
+		{"JSON", "JSON", schema.TypeJSON, 0, 0, 0, schema.TypeUnknown},
+		{"ARRAY<STRING>", "ARRAY<STRING(MAX)>", schema.TypeArray, 0, 0, 0, schema.TypeString},
+		{"ARRAY<STRING(100)>", "ARRAY<STRING(100)>", schema.TypeArray, 0, 0, 100, schema.TypeString},
+		{"ARRAY<INT64>", "ARRAY<INT64>", schema.TypeArray, 0, 0, 0, schema.TypeInt64},
+		{"ARRAY<FLOAT64>", "ARRAY<FLOAT64>", schema.TypeArray, 0, 0, 0, schema.TypeFloat64},
+		{"ARRAY<BOOL>", "ARRAY<BOOL>", schema.TypeArray, 0, 0, 0, schema.TypeBoolean},
+		{"lowercase", "bool", schema.TypeBoolean, 0, 0, 0, schema.TypeUnknown},
+		{"mixed case", "String(MAX)", schema.TypeString, 0, 0, 0, schema.TypeUnknown},
+		{"unknown type", "PROTO", schema.TypeString, 0, 0, 0, schema.TypeUnknown},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dt, p, s, at := mapSpannerTypeString(tt.input)
+			dt, p, s, ml, at := mapSpannerTypeString(tt.input)
 			assert.Equal(t, tt.wantType, dt, "DataType")
+			assert.Equal(t, tt.wantLen, ml, "MaxLength")
 			assert.Equal(t, tt.wantPrec, p, "Precision")
 			assert.Equal(t, tt.wantScale, s, "Scale")
 			assert.Equal(t, tt.wantArray, at, "ArrayType")
@@ -300,7 +303,6 @@ func TestBuildArrowSchema(t *testing.T) {
 	assert.False(t, arrowSchema.Field(0).Nullable)
 	assert.True(t, arrowSchema.Field(1).Nullable)
 }
-
 
 func TestExtractArrayValueNullStaysNil(t *testing.T) {
 	// A NULL Spanner array must reach arrowconv.AppendValue as an untyped nil.
