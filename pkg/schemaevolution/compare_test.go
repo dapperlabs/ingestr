@@ -894,3 +894,33 @@ func TestCompare_LengthFromOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestSameColumnTypeShapeUnboundedDestination(t *testing.T) {
+	// pg text/numeric report length/precision 0; a bounded Spanner source
+	// into an unbounded destination is not drift (the pilot's baseline
+	// schema is exactly this shape — without the rule, freeze rejects
+	// "string to string" and evolve emits no-op ALTERs that Postgres
+	// forbids on generated-column inputs).
+	boundedSrc := schema.Column{DataType: schema.TypeString, MaxLength: 255}
+	unboundedDst := schema.Column{DataType: schema.TypeString}
+	if !sameColumnTypeShape(boundedSrc, unboundedDst) {
+		t.Error("bounded string into unbounded text must be compatible")
+	}
+	if sameColumnTypeShape(
+		schema.Column{DataType: schema.TypeString},            // source unbounded
+		schema.Column{DataType: schema.TypeString, MaxLength: 255}, // dest bounded
+	) {
+		t.Error("unbounded source into bounded destination must read as drift")
+	}
+	numSrc := schema.Column{DataType: schema.TypeDecimal, Precision: 38, Scale: 9}
+	numDst := schema.Column{DataType: schema.TypeDecimal}
+	if !sameColumnTypeShape(numSrc, numDst) {
+		t.Error("Spanner NUMERIC(38,9) into unbounded numeric must be compatible")
+	}
+	if !sameColumnTypeShape(boundedSrc, schema.Column{DataType: schema.TypeString, MaxLength: 255}) {
+		t.Error("equal bounds must stay compatible")
+	}
+	if sameColumnTypeShape(boundedSrc, schema.Column{DataType: schema.TypeString, MaxLength: 100}) {
+		t.Error("mismatched bounds must stay drift")
+	}
+}
