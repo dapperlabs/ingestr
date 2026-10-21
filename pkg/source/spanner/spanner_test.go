@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -22,6 +24,11 @@ import (
 )
 
 func TestParseURI(t *testing.T) {
+	// parseURI reads the credentials file eagerly (type detection), so the
+	// path fixture needs a real file.
+	credsFile := filepath.Join(t.TempDir(), "creds.json")
+	require.NoError(t, os.WriteFile(credsFile, []byte(`{"type":"service_account"}`), 0o600))
+
 	tests := []struct {
 		name       string
 		uri        string
@@ -36,7 +43,7 @@ func TestParseURI(t *testing.T) {
 		},
 		{
 			name:       "valid URI with credentials_path",
-			uri:        "spanner://?project_id=proj&instance_id=inst&database=db&credentials_path=/path/to/creds.json",
+			uri:        "spanner://?project_id=proj&instance_id=inst&database=db&credentials_path="+credsFile+"",
 			wantDBPath: "projects/proj/instances/inst/databases/db",
 		},
 		{
@@ -360,6 +367,24 @@ func TestExtractArrayValueNullElementFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "index 1") || !strings.Contains(err.Error(), "Tags") {
 		t.Fatalf("error should name the column and the element index, got: %v", err)
+	}
+}
+
+func TestCredentialsJSONOptionTypes(t *testing.T) {
+	// The credential file's own "type" decides the option: service_account
+	// keys and external_account (Workload Identity Federation — the EKS
+	// pilot's shape) both parse; anything else is a loud error.
+	if _, err := credentialsJSONOption([]byte(`{"type":"service_account"}`)); err != nil {
+		t.Errorf("service_account: %v", err)
+	}
+	if _, err := credentialsJSONOption([]byte(`{"type":"external_account"}`)); err != nil {
+		t.Errorf("external_account (WIF) must be accepted: %v", err)
+	}
+	if _, err := credentialsJSONOption([]byte(`{"type":"authorized_user"}`)); err == nil {
+		t.Error("authorized_user must fail loudly — feeding a user ADC here is the az-ops/dapperlabs mix-up all over again")
+	}
+	if _, err := credentialsJSONOption([]byte(`not json`)); err == nil {
+		t.Error("garbage must fail loudly")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"log"
 	"net/url"
 	"strings"
@@ -788,16 +789,55 @@ func parseURI(uri string) (string, []option.ClientOption, error) {
 
 	var opts []option.ClientOption
 	if credPath := query.Get("credentials_path"); credPath != "" {
-		opts = append(opts, option.WithAuthCredentialsFile(option.ServiceAccount, credPath))
+		opt, err := credentialsFileOption(credPath)
+		if err != nil {
+			return "", nil, err
+		}
+		opts = append(opts, opt)
 	} else if credBase64 := query.Get("credentials_base64"); credBase64 != "" {
 		credJSON, err := base64.StdEncoding.DecodeString(credBase64)
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to decode credentials_base64: %w", err)
 		}
-		opts = append(opts, option.WithAuthCredentialsJSON(option.ServiceAccount, credJSON))
+		opt, err := credentialsJSONOption(credJSON)
+		if err != nil {
+			return "", nil, err
+		}
+		opts = append(opts, opt)
 	}
 
 	return dbPath, opts, nil
+}
+
+// credentialsFileOption builds the client option for a credentials file whose
+// type is read from the file itself: service_account keys parse as
+// ServiceAccount, external_account (Workload Identity Federation — the EKS
+// pilot's shape) as ExternalAccount. Hard-coding ServiceAccount rejects WIF
+// configs with a parse error that reads like a permissions problem.
+func credentialsFileOption(path string) (option.ClientOption, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read credentials file: %w", err)
+	}
+	return credentialsJSONOption(raw)
+}
+
+func credentialsJSONOption(raw []byte) (option.ClientOption, error) {
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return nil, fmt.Errorf("failed to parse credentials JSON: %w", err)
+	}
+	switch head.Type {
+	case "external_account":
+		return option.WithAuthCredentialsJSON(option.ExternalAccount, raw), nil
+	case "service_account", "":
+		// Empty keeps the historical behaviour for hand-built configs.
+		return option.WithAuthCredentialsJSON(option.ServiceAccount, raw), nil
+	default:
+		return nil, fmt.Errorf("unsupported credentials type %q (want service_account or external_account)", head.Type)
+	}
 }
 
 func filterColumns(columns []schema.Column, exclude []string) []schema.Column {
