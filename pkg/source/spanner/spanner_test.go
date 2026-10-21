@@ -643,3 +643,33 @@ func TestArrayValuesNilSliceStaysNull(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, got)
 }
+
+func TestMergeDeclaredLengths(t *testing.T) {
+	// The query path carries no declared lengths; the merge overlays them
+	// from information_schema. Regression for the freeze failure that twice
+	// killed the staging copy ("type change from string to string").
+	queryCols := []schema.Column{
+		{Name: "Title", DataType: schema.TypeString},              // no length
+		{Name: "TeamNames", DataType: schema.TypeArray, ArrayType: schema.TypeString},
+		{Name: "Ghost"}, // not in information_schema: untouched
+	}
+	infoCols := []schema.Column{
+		{Name: "Title", DataType: schema.TypeString, MaxLength: 255},
+		{Name: "TeamNames", DataType: schema.TypeArray, ArrayType: schema.TypeString, MaxLength: 100},
+		{Name: "Orphan", MaxLength: 50}, // no query column: ignored
+	}
+
+	out := mergeDeclaredLengths(queryCols, infoCols)
+	if out[0].MaxLength != 255 {
+		t.Errorf("Title: got %d, want 255", out[0].MaxLength)
+	}
+	if out[1].MaxLength != 100 {
+		t.Errorf("TeamNames (array element length): got %d, want 100", out[1].MaxLength)
+	}
+	if out[2].MaxLength != 0 {
+		t.Errorf("Ghost must stay untouched: got %d", out[2].MaxLength)
+	}
+	if queryCols[0].MaxLength != 0 {
+		t.Error("input must not be mutated")
+	}
+}

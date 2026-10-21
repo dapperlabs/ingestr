@@ -119,15 +119,7 @@ func (s *SpannerSource) getSchema(ctx context.Context, table string) (*schema.Ta
 		return nil, infoErr
 	}
 	if infoErr == nil {
-		byName := make(map[string]schema.Column, len(infoColumns))
-		for _, c := range infoColumns {
-			byName[c.Name] = c
-		}
-		for i := range columns {
-			if info, ok := byName[columns[i].Name]; ok {
-				columns[i].MaxLength = info.MaxLength
-			}
-		}
+		columns = mergeDeclaredLengths(columns, infoColumns)
 	}
 	if columns == nil {
 		columns = infoColumns
@@ -148,6 +140,25 @@ func (s *SpannerSource) getSchema(ctx context.Context, table string) (*schema.Ta
 		Columns:     columns,
 		PrimaryKeys: primaryKeys,
 	}, nil
+}
+
+// mergeDeclaredLengths overlays the declared STRING(n)/BYTES(n) bounds from
+// the information_schema read onto the query-derived columns (result-set
+// metadata carries none). Only the length crosses; the query path's nullability
+// and types already agree or the mismatch is real drift worth keeping.
+func mergeDeclaredLengths(queryCols, infoCols []schema.Column) []schema.Column {
+	byName := make(map[string]int, len(infoCols))
+	for _, c := range infoCols {
+		byName[c.Name] = c.MaxLength
+	}
+	out := make([]schema.Column, len(queryCols))
+	copy(out, queryCols)
+	for i := range out {
+		if length, ok := byName[out[i].Name]; ok {
+			out[i].MaxLength = length
+		}
+	}
+	return out
 }
 
 func (s *SpannerSource) getSchemaFromQuery(ctx context.Context, table string) ([]schema.Column, error) {
