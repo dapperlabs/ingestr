@@ -293,6 +293,53 @@ func TestBuildArrowSchema(t *testing.T) {
 	assert.True(t, arrowSchema.Field(1).Nullable)
 }
 
+
+func TestExtractArrayValueNullStaysNil(t *testing.T) {
+	// A NULL Spanner array must reach arrowconv.AppendValue as an untyped nil.
+	// Regression: arrayValues returned []E, so a nil slice boxed into
+	// interface{} was non-nil, AppendValue took the append path, and NULL
+	// arrays landed in Postgres as empty arrays — "not configured" and
+	// "configured empty" collapsed into one value.
+	nullStringArray := columnGetterFunc(func(idx int, ptr interface{}) error {
+		p, ok := ptr.(*[]spanner.NullString)
+		if !ok {
+			return fmt.Errorf("unexpected decode target %T", ptr)
+		}
+		*p = nil // NULL array
+		return nil
+	})
+
+	val, err := extractArrayValue(nullStringArray, 0, schema.Column{Name: "Tags", ArrayType: schema.TypeString})
+	if err != nil {
+		t.Fatalf("extractArrayValue: %v", err)
+	}
+	if val != nil {
+		t.Fatalf("NULL array decoded to non-nil interface %T (%v); AppendValue would write an empty list", val, val)
+	}
+
+	// And the empty array must stay distinguishable from NULL.
+	emptyStringArray := columnGetterFunc(func(idx int, ptr interface{}) error {
+		p := ptr.(*[]spanner.NullString)
+		*p = []spanner.NullString{}
+		return nil
+	})
+	val, err = extractArrayValue(emptyStringArray, 0, schema.Column{Name: "Tags", ArrayType: schema.TypeString})
+	if err != nil {
+		t.Fatalf("extractArrayValue: %v", err)
+	}
+	got, ok := val.([]string)
+	if !ok {
+		t.Fatalf("empty array decoded to %T, want []string", val)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("empty array decoded to %#v, want non-nil zero-length slice", got)
+	}
+}
+
+type columnGetterFunc func(idx int, ptr interface{}) error
+
+func (f columnGetterFunc) Column(idx int, ptr interface{}) error { return f(idx, ptr) }
+
 func TestSchemes(t *testing.T) {
 	s := NewSpannerSource()
 	assert.Equal(t, []string{"spanner"}, s.Schemes())
