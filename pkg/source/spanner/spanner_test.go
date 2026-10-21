@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -336,6 +337,32 @@ func TestExtractArrayValueNullStaysNil(t *testing.T) {
 	}
 }
 
+func TestExtractArrayValueNullElementFails(t *testing.T) {
+	// A NULL element inside an array must fail the copy, not silently
+	// shorten it — positions carry meaning in the atlas schema, and a
+	// dropped NULL is data loss that no row-count check would ever catch.
+	withNullElement := columnGetterFunc(func(idx int, ptr interface{}) error {
+		p, ok := ptr.(*[]spanner.NullString)
+		if !ok {
+			return fmt.Errorf("unexpected decode target %T", ptr)
+		}
+		*p = []spanner.NullString{
+			{StringVal: "a", Valid: true},
+			{Valid: false}, // the NULL element
+			{StringVal: "c", Valid: true},
+		}
+		return nil
+	})
+
+	_, err := extractArrayValue(withNullElement, 0, schema.Column{Name: "Tags", ArrayType: schema.TypeString})
+	if err == nil {
+		t.Fatal("a NULL element must fail loudly, not be dropped")
+	}
+	if !strings.Contains(err.Error(), "index 1") || !strings.Contains(err.Error(), "Tags") {
+		t.Fatalf("error should name the column and the element index, got: %v", err)
+	}
+}
+
 type columnGetterFunc func(idx int, ptr interface{}) error
 
 func (f columnGetterFunc) Column(idx int, ptr interface{}) error { return f(idx, ptr) }
@@ -419,7 +446,6 @@ func TestExtractColumnValueArrayNumericIsExact(t *testing.T) {
 			{Numeric: *mustRat(t, "0.1"), Valid: true},
 			{Numeric: *mustRat(t, "-0.000000001"), Valid: true},
 			{Numeric: *mustRat(t, "9007199254740993.5"), Valid: true},
-			{Valid: false},
 		},
 	}}
 
@@ -447,7 +473,6 @@ func TestArrayNumericSurvivesArrowBatchConversion(t *testing.T) {
 		[]spanner.NullNumeric{
 			{Numeric: *mustRat(t, "12345678901234.567890123"), Valid: true},
 			{Numeric: *mustRat(t, "-0.000000001"), Valid: true},
-			{Valid: false},
 		},
 	}}
 
@@ -473,7 +498,8 @@ func TestArrayNumericSurvivesArrowBatchConversion(t *testing.T) {
 }
 
 // Every element type the Spanner client can report for an array must be
-// converted rather than silently dropped.
+// converted; NULL or unconvertible elements fail loudly (positions carry
+// meaning), never silently dropped.
 func TestExtractColumnValueArrayElementTypes(t *testing.T) {
 	timestamp := time.Date(2026, time.October, 20, 13, 45, 30, 123456000, time.UTC)
 	day := civil.Date{Year: 2026, Month: time.October, Day: 20}
@@ -487,7 +513,7 @@ func TestExtractColumnValueArrayElementTypes(t *testing.T) {
 		{
 			name:      "string",
 			arrayType: schema.TypeString,
-			value:     []spanner.NullString{{StringVal: "a", Valid: true}, {Valid: false}, {StringVal: "b", Valid: true}},
+			value:     []spanner.NullString{{StringVal: "a", Valid: true}, {StringVal: "b", Valid: true}},
 			want:      []string{"a", "b"},
 		},
 		{
@@ -580,15 +606,6 @@ func TestExtractColumnValueArrayDecodeFailureIsReported(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, got)
 	assert.Contains(t, err.Error(), `"prices"`)
-}
-
-func TestArrayValuesDropsNullElements(t *testing.T) {
-	col := schema.Column{Name: "tags", DataType: schema.TypeArray, ArrayType: schema.TypeString}
-	row := stubColumnRow{values: []interface{}{[]spanner.NullString{{Valid: false}, {Valid: false}}}}
-
-	got, err := extractColumnValue(row, 0, col)
-	require.NoError(t, err)
-	assert.Equal(t, []string{}, got)
 }
 
 func TestArrayValuesNilSliceStaysNull(t *testing.T) {

@@ -476,10 +476,13 @@ func arrayValues[V any, E any](row columnGetter, idx int, col schema.Column, con
 		return nil, nil
 	}
 	result := make([]E, 0, len(v))
-	for _, element := range v {
+	for i, element := range v {
 		value, ok := convert(element)
 		if !ok {
-			continue
+			// Fail loudly: silently skipping a NULL element shortens the
+			// array — same class of data loss as the NULL-array boxing this
+			// boundary already had. Positions matter in the atlas schema.
+			return nil, fmt.Errorf("ARRAY<%s> column %q has a NULL or unconvertible element at index %d", col.ArrayType, col.Name, i)
 		}
 		result = append(result, value)
 	}
