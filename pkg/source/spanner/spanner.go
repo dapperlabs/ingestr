@@ -37,6 +37,13 @@ type SpannerSource struct {
 	// CPU and default-priority reads would compete head-on with live traffic.
 	readPriority   string
 	exactStaleness time.Duration
+	// dataBoost runs the data read as a PartitionQuery on Spanner-independent
+	// compute — zero PU draw on the serving instance. The production consumer
+	// DB already runs hot (p95 76%); for the migration's giant tables this is
+	// the difference between "deprioritized" and "not on the instance at all".
+	// Retention still applies to the transaction's snapshot: pair with extract
+	// partitions for tables whose copy exceeds version retention.
+	dataBoost bool
 }
 
 func NewSpannerSource() *SpannerSource {
@@ -48,12 +55,13 @@ func (s *SpannerSource) Schemes() []string {
 }
 
 func (s *SpannerSource) Connect(ctx context.Context, uri string) error {
-	dbPath, opts, readPriority, exactStaleness, err := parseURI(uri)
+	dbPath, opts, readPriority, exactStaleness, dataBoost, err := parseURI(uri)
 	if err != nil {
 		return err
 	}
 	s.readPriority = readPriority
 	s.exactStaleness = exactStaleness
+	s.dataBoost = dataBoost
 
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{Logger: silentLogger}, opts...)
 	if err != nil {
@@ -409,9 +417,9 @@ func (s *SpannerSource) read(ctx context.Context, table string, tableSchema *sch
 		// Bulk reads get the configured priority/staleness; schema and metadata
 		// reads elsewhere stay default. Priority low = Spanner deprioritizes us
 		// under contention; a staleness bound lets followers serve the read.
-		txn := s.client.Single()
+		bound := spanner.StrongRead()
 		if s.exactStaleness > 0 {
-			txn = txn.WithTimestampBound(spanner.ExactStaleness(s.exactStaleness))
+			bound = spanner.ExactStaleness(s.exactStaleness)
 		}
 		qopts := spanner.QueryOptions{}
 		if s.readPriority == "low" {
@@ -419,7 +427,35 @@ func (s *SpannerSource) read(ctx context.Context, table string, tableSchema *sch
 		}
 
 		startQuery := time.Now()
-		iter := txn.QueryWithOptions(ctx, spanner.NewStatement(query), qopts)
+		var iter rowIterator
+		var cleanup func()
+		if s.dataBoost {
+			// PartitionQuery on Spanner-independent compute: zero PU draw on the
+			// serving instance. The transaction pins a snapshot at creation —
+			// extract partitions keep each window's transaction short.
+			btxn, err := s.client.BatchReadOnlyTransaction(ctx, bound)
+			if err != nil {
+				results <- source.RecordBatchResult{Err: fmt.Errorf("failed to open batch transaction: %w", err)}
+				return
+			}
+			qopts.DataBoostEnabled = true
+			parts, err := btxn.PartitionQueryWithOptions(ctx, spanner.NewStatement(query),
+				spanner.PartitionOptions{PartitionBytes: 64 << 20}, qopts)
+			if err != nil {
+				btxn.Cleanup(ctx)
+				btxn.Close()
+				results <- source.RecordBatchResult{Err: fmt.Errorf("failed to partition query: %w", err)}
+				return
+			}
+			config.Debug("[SPANNER] DataBoost: %d partitions", len(parts))
+			iter, cleanup = &partitionChain{ctx: ctx, txn: btxn, parts: parts}, func() { btxn.Cleanup(ctx); btxn.Close() }
+		} else {
+			txn := s.client.Single().WithTimestampBound(bound)
+			iter, cleanup = txn.QueryWithOptions(ctx, spanner.NewStatement(query), qopts), func() {}
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
 		defer iter.Stop()
 		config.Debug("[SPANNER] Query started in %v", time.Since(startQuery))
 
@@ -451,7 +487,52 @@ func (s *SpannerSource) read(ctx context.Context, table string, tableSchema *sch
 	return results, nil
 }
 
-func (s *SpannerSource) rowsToArrowBatch(iter *spanner.RowIterator, arrowSchema *arrow.Schema, columns []schema.Column, batchSize int, maxBatchBytes int64) (arrow.RecordBatch, int64, error) {
+// rowIterator is the seam the DataBoost partition chain and the plain
+// single-query iterator share.
+type rowIterator interface {
+	Next() (*spanner.Row, error)
+	Stop()
+}
+
+// partitionChain serves a BatchReadOnlyTransaction's partitions as one
+// sequential iterator. Sequential, not parallel: the point of DataBoost is
+// zero draw on the serving instance, not throughput records, and the batch
+// pipeline downstream is the pacer either way.
+type partitionChain struct {
+	ctx    context.Context
+	txn    *spanner.BatchReadOnlyTransaction
+	parts  []*spanner.Partition
+	idx    int
+	iter   *spanner.RowIterator
+}
+
+func (c *partitionChain) Next() (*spanner.Row, error) {
+	for {
+		if c.iter == nil {
+			if c.idx >= len(c.parts) {
+				return nil, iterator.Done
+			}
+			c.iter = c.txn.Execute(c.ctx, c.parts[c.idx])
+			c.idx++
+		}
+		row, err := c.iter.Next()
+		if err == iterator.Done {
+			c.iter.Stop()
+			c.iter = nil
+			continue
+		}
+		return row, err
+	}
+}
+
+func (c *partitionChain) Stop() {
+	if c.iter != nil {
+		c.iter.Stop()
+		c.iter = nil
+	}
+}
+
+func (s *SpannerSource) rowsToArrowBatch(iter rowIterator, arrowSchema *arrow.Schema, columns []schema.Column, batchSize int, maxBatchBytes int64) (arrow.RecordBatch, int64, error) {
 	mem := memory.NewGoAllocator()
 	builders := make([]array.Builder, len(columns))
 	for i, field := range arrowSchema.Fields() {
@@ -839,10 +920,10 @@ func (s *SpannerSource) ExecuteCustomQuery(ctx context.Context, query string, op
 	return results, nil
 }
 
-func parseURI(uri string) (string, []option.ClientOption, string, time.Duration, error) {
+func parseURI(uri string) (string, []option.ClientOption, string, time.Duration, bool, error) {
 	parsed, err := url.Parse(uri)
 	if err != nil {
-		return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: %w", err)
+		return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: %w", err)
 	}
 
 	query := parsed.Query()
@@ -851,7 +932,7 @@ func parseURI(uri string) (string, []option.ClientOption, string, time.Duration,
 	database := query.Get("database")
 
 	if projectID == "" || instanceID == "" || database == "" {
-		return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: project_id, instance_id, and database are required, e.g. spanner://?project_id=PROJECT&instance_id=INSTANCE&database=DATABASE")
+		return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: project_id, instance_id, and database are required, e.g. spanner://?project_id=PROJECT&instance_id=INSTANCE&database=DATABASE")
 	}
 
 	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, database)
@@ -860,13 +941,15 @@ func parseURI(uri string) (string, []option.ClientOption, string, time.Duration,
 	switch readPriority {
 	case "", "high", "low":
 	default:
-		return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: read_priority must be high or low")
+		return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: read_priority must be high or low")
 	}
+	dataBoost := query.Get("data_boost") == "true"
+
 	var exactStaleness time.Duration
 	if raw := query.Get("exact_staleness"); raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil || d < 0 {
-			return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: exact_staleness must be a Go duration like 60s")
+			return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: exact_staleness must be a Go duration like 60s")
 		}
 		exactStaleness = d
 	}
@@ -875,22 +958,22 @@ func parseURI(uri string) (string, []option.ClientOption, string, time.Duration,
 	if credPath := query.Get("credentials_path"); credPath != "" {
 		opt, err := credentialsFileOption(credPath)
 		if err != nil {
-			return "", nil, "", 0, err
+			return "", nil, "", 0, false, err
 		}
 		opts = append(opts, opt)
 	} else if credBase64 := query.Get("credentials_base64"); credBase64 != "" {
 		credJSON, err := base64.StdEncoding.DecodeString(credBase64)
 		if err != nil {
-			return "", nil, "", 0, fmt.Errorf("failed to decode credentials_base64: %w", err)
+			return "", nil, "", 0, false, fmt.Errorf("failed to decode credentials_base64: %w", err)
 		}
 		opt, err := credentialsJSONOption(credJSON)
 		if err != nil {
-			return "", nil, "", 0, err
+			return "", nil, "", 0, false, err
 		}
 		opts = append(opts, opt)
 	}
 
-	return dbPath, opts, readPriority, exactStaleness, nil
+	return dbPath, opts, readPriority, exactStaleness, dataBoost, nil
 }
 
 // credentialsFileOption builds the client option for a credentials file whose
