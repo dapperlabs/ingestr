@@ -85,7 +85,7 @@ func TestParseURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dbPath, opts, err := parseURI(tt.uri)
+			dbPath, opts, _, _, err := parseURI(tt.uri)
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errContain)
@@ -393,6 +393,73 @@ func TestCredentialsJSONOptionTypes(t *testing.T) {
 type columnGetterFunc func(idx int, ptr interface{}) error
 
 func (f columnGetterFunc) Column(idx int, ptr interface{}) error { return f(idx, ptr) }
+
+func TestParseURIReadControls(t *testing.T) {
+	// read_priority validates; exact_staleness parses as a Go duration.
+	_, _, prio, stale, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=low&exact_staleness=60s")
+	if err != nil {
+		t.Fatalf("valid controls: %v", err)
+	}
+	if prio != "low" || stale != time.Minute {
+		t.Fatalf("got priority=%q staleness=%v", prio, stale)
+	}
+	if _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=urgent"); err == nil {
+		t.Fatal("bogus read_priority must fail loudly")
+	}
+	if _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&exact_staleness=soon"); err == nil {
+		t.Fatal("unparsable exact_staleness must fail loudly")
+	}
+}
+
+func TestBuildSelectQueryPartitionWindows(t *testing.T) {
+	// The retention-window fix: each partition window must become a WHERE
+	// clause on the partition column — a fresh snapshot per window, so no
+	// snapshot outlives version retention on a giant table.
+	cols := []schema.Column{{Name: "Id", DataType: schema.TypeString}}
+	start := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+
+	q := buildSelectQuery("Deposits", cols, source.ReadOptions{
+		ExtractPartitionBy:   "DepositedAt",
+		ExtractPartitionStart: &start,
+		ExtractPartitionEnd:   &end,
+	})
+	want := "SELECT `Id` FROM `Deposits` WHERE `DepositedAt` >= TIMESTAMP('2026-10-22T00:00:00Z') AND `DepositedAt` < TIMESTAMP('2026-10-22T01:00:00Z')"
+	if q != want {
+		t.Fatalf("time window:\n got %s\nwant %s", q, want)
+	}
+
+	// inclusive end (the last window must not drop the boundary row)
+	q = buildSelectQuery("Deposits", cols, source.ReadOptions{
+		ExtractPartitionBy:           "DepositedAt",
+		ExtractPartitionStart:         &start,
+		ExtractPartitionEnd:           &end,
+		ExtractPartitionEndInclusive:  true,
+	})
+	if !strings.Contains(q, "`DepositedAt` <= TIMESTAMP") {
+		t.Fatalf("inclusive end must use <=: %s", q)
+	}
+
+	// numeric window
+	lo, hi := int64(1000), int64(2000)
+	q = buildSelectQuery("Quests", cols, source.ReadOptions{
+		ExtractPartitionBy:           "SerialNumber",
+		ExtractPartitionNumericStart: &lo,
+		ExtractPartitionNumericEnd:   &hi,
+	})
+	if !strings.Contains(q, "`SerialNumber` >= 1000") || !strings.Contains(q, "`SerialNumber` < 2000") {
+		t.Fatalf("numeric window: %s", q)
+	}
+
+	// the null window
+	q = buildSelectQuery("Quests", cols, source.ReadOptions{
+		ExtractPartitionBy:     "SerialNumber",
+		ExtractPartitionIsNull: true,
+	})
+	if !strings.Contains(q, "`SerialNumber` IS NULL") {
+		t.Fatalf("null window: %s", q)
+	}
+}
 
 func TestSchemes(t *testing.T) {
 	s := NewSpannerSource()
