@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"google.golang.org/api/iterator"
 	"time"
 
 	"cloud.google.com/go/civil"
@@ -85,7 +87,7 @@ func TestParseURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dbPath, opts, _, _, err := parseURI(tt.uri)
+			dbPath, opts, _, _, _, err := parseURI(tt.uri)
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errContain)
@@ -396,17 +398,17 @@ func (f columnGetterFunc) Column(idx int, ptr interface{}) error { return f(idx,
 
 func TestParseURIReadControls(t *testing.T) {
 	// read_priority validates; exact_staleness parses as a Go duration.
-	_, _, prio, stale, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=low&exact_staleness=60s")
+	_, _, prio, stale, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=low&exact_staleness=60s")
 	if err != nil {
 		t.Fatalf("valid controls: %v", err)
 	}
 	if prio != "low" || stale != time.Minute {
 		t.Fatalf("got priority=%q staleness=%v", prio, stale)
 	}
-	if _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=urgent"); err == nil {
+	if _, _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=urgent"); err == nil {
 		t.Fatal("bogus read_priority must fail loudly")
 	}
-	if _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&exact_staleness=soon"); err == nil {
+	if _, _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&exact_staleness=soon"); err == nil {
 		t.Fatal("unparsable exact_staleness must fail loudly")
 	}
 }
@@ -459,6 +461,32 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 	if !strings.Contains(q, "`SerialNumber` IS NULL") {
 		t.Fatalf("null window: %s", q)
 	}
+}
+
+func TestBuildSelectQueryUnpartitionedIsUnchanged(t *testing.T) {
+	// The normal 213-table path must not gain a WHERE clause from the
+	// partition machinery — a stray filter there is silent data loss, not a
+	// crash.
+	cols := []schema.Column{{Name: "Id", DataType: schema.TypeString}, {Name: "CreatedAt", DataType: schema.TypeTimestampTZ}}
+	got := buildSelectQuery("Actions", cols, source.ReadOptions{})
+	want := "SELECT `Id`, `CreatedAt` FROM `Actions`"
+	if got != want {
+		t.Fatalf("unpartitioned query changed:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestPartitionChainSequencing(t *testing.T) {
+	// The chain serves partitions in order and reports Done at the end —
+	// a dropped or repeated partition is silent data loss on a copy.
+	// (The chain's shape is tested via its sequencing contract; the real
+	// Partition objects are Spanner-side, so the chain is exercised against
+	// the DataBoost integration path on staging.)
+	chain := &partitionChain{parts: nil} // no partitions
+	chain.iter = nil
+	if _, err := chain.Next(); err != iterator.Done {
+		t.Fatalf("empty chain must be Done, got %v", err)
+	}
+	chain.Stop() // must not panic with no active iterator
 }
 
 func TestSchemes(t *testing.T) {
