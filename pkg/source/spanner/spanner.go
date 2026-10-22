@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -28,8 +29,14 @@ import (
 var silentLogger = log.New(io.Discard, "", 0)
 
 type SpannerSource struct {
-	client *spanner.Client
-	dbPath string
+	client       *spanner.Client
+	dbPath       string
+	// readPriority and exactStaleness shape the bulk-read path only (the data
+	// read in read()); schema/metadata reads stay default-priority strong.
+	// The atlas production copy needs both: the consumer DB runs at p95 76%
+	// CPU and default-priority reads would compete head-on with live traffic.
+	readPriority   string
+	exactStaleness time.Duration
 }
 
 func NewSpannerSource() *SpannerSource {
@@ -41,10 +48,12 @@ func (s *SpannerSource) Schemes() []string {
 }
 
 func (s *SpannerSource) Connect(ctx context.Context, uri string) error {
-	dbPath, opts, err := parseURI(uri)
+	dbPath, opts, readPriority, exactStaleness, err := parseURI(uri)
 	if err != nil {
 		return err
 	}
+	s.readPriority = readPriority
+	s.exactStaleness = exactStaleness
 
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{Logger: silentLogger}, opts...)
 	if err != nil {
@@ -93,6 +102,10 @@ func (s *SpannerSource) GetTable(ctx context.Context, req source.TableRequest) (
 		TablePrimaryKeys:    pks,
 		TableIncrementalKey: req.IncrementalKey,
 		TableStrategy:       strategy,
+		// Each extract window is its own Read call, and every read opens a
+		// fresh Single() snapshot — so a partitioned giant table can never hold
+		// a snapshot past version retention (the Deposits failure class).
+		TableSupportsExtractPartitioning: true,
 		KnownSchema:         true,
 		SchemaFn: func(ctx context.Context) (*schema.TableSchema, error) {
 			return tableSchema, nil
@@ -393,8 +406,20 @@ func (s *SpannerSource) read(ctx context.Context, table string, tableSchema *sch
 		query := buildSelectQuery(table, columns, opts)
 		config.Debug("[SPANNER] Executing query: %s", query)
 
+		// Bulk reads get the configured priority/staleness; schema and metadata
+		// reads elsewhere stay default. Priority low = Spanner deprioritizes us
+		// under contention; a staleness bound lets followers serve the read.
+		txn := s.client.Single()
+		if s.exactStaleness > 0 {
+			txn = txn.WithTimestampBound(spanner.ExactStaleness(s.exactStaleness))
+		}
+		qopts := spanner.QueryOptions{}
+		if s.readPriority == "low" {
+			qopts.Priority = sppb.RequestOptions_PRIORITY_LOW
+		}
+
 		startQuery := time.Now()
-		iter := s.client.Single().Query(ctx, spanner.NewStatement(query))
+		iter := txn.QueryWithOptions(ctx, spanner.NewStatement(query), qopts)
 		defer iter.Stop()
 		config.Debug("[SPANNER] Query started in %v", time.Since(startQuery))
 
@@ -814,10 +839,10 @@ func (s *SpannerSource) ExecuteCustomQuery(ctx context.Context, query string, op
 	return results, nil
 }
 
-func parseURI(uri string) (string, []option.ClientOption, error) {
+func parseURI(uri string) (string, []option.ClientOption, string, time.Duration, error) {
 	parsed, err := url.Parse(uri)
 	if err != nil {
-		return "", nil, fmt.Errorf("invalid Spanner URI: %w", err)
+		return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: %w", err)
 	}
 
 	query := parsed.Query()
@@ -826,31 +851,46 @@ func parseURI(uri string) (string, []option.ClientOption, error) {
 	database := query.Get("database")
 
 	if projectID == "" || instanceID == "" || database == "" {
-		return "", nil, fmt.Errorf("invalid Spanner URI: project_id, instance_id, and database are required, e.g. spanner://?project_id=PROJECT&instance_id=INSTANCE&database=DATABASE")
+		return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: project_id, instance_id, and database are required, e.g. spanner://?project_id=PROJECT&instance_id=INSTANCE&database=DATABASE")
 	}
 
 	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, database)
+
+	readPriority := strings.ToLower(query.Get("read_priority"))
+	switch readPriority {
+	case "", "high", "low":
+	default:
+		return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: read_priority must be high or low")
+	}
+	var exactStaleness time.Duration
+	if raw := query.Get("exact_staleness"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			return "", nil, "", 0, fmt.Errorf("invalid Spanner URI: exact_staleness must be a Go duration like 60s")
+		}
+		exactStaleness = d
+	}
 
 	var opts []option.ClientOption
 	if credPath := query.Get("credentials_path"); credPath != "" {
 		opt, err := credentialsFileOption(credPath)
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", 0, err
 		}
 		opts = append(opts, opt)
 	} else if credBase64 := query.Get("credentials_base64"); credBase64 != "" {
 		credJSON, err := base64.StdEncoding.DecodeString(credBase64)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to decode credentials_base64: %w", err)
+			return "", nil, "", 0, fmt.Errorf("failed to decode credentials_base64: %w", err)
 		}
 		opt, err := credentialsJSONOption(credJSON)
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", 0, err
 		}
 		opts = append(opts, opt)
 	}
 
-	return dbPath, opts, nil
+	return dbPath, opts, readPriority, exactStaleness, nil
 }
 
 // credentialsFileOption builds the client option for a credentials file whose
@@ -928,6 +968,32 @@ func buildSelectQuery(table string, columns []schema.Column, opts source.ReadOpt
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(colNames, ", "), quoteIdentifier(table))
 
 	var conditions []string
+	if opts.ExtractPartitionBy != "" {
+		col := quoteIdentifier(opts.ExtractPartitionBy)
+		if opts.ExtractPartitionStart != nil {
+			conditions = append(conditions, fmt.Sprintf("%s >= TIMESTAMP('%s')", col, opts.ExtractPartitionStart.Format("2006-01-02T15:04:05Z")))
+		}
+		if opts.ExtractPartitionEnd != nil {
+			op := "<="
+			if !opts.ExtractPartitionEndInclusive {
+				op = "<"
+			}
+			conditions = append(conditions, fmt.Sprintf("%s %s TIMESTAMP('%s')", col, op, opts.ExtractPartitionEnd.Format("2006-01-02T15:04:05Z")))
+		}
+		if opts.ExtractPartitionNumericStart != nil {
+			conditions = append(conditions, fmt.Sprintf("%s >= %d", col, *opts.ExtractPartitionNumericStart))
+		}
+		if opts.ExtractPartitionNumericEnd != nil {
+			op := "<="
+			if !opts.ExtractPartitionEndInclusive {
+				op = "<"
+			}
+			conditions = append(conditions, fmt.Sprintf("%s %s %d", col, op, *opts.ExtractPartitionNumericEnd))
+		}
+		if opts.ExtractPartitionIsNull {
+			conditions = append(conditions, fmt.Sprintf("%s IS NULL", col))
+		}
+	}
 	if opts.IncrementalKey != "" {
 		if opts.IntervalStart != nil {
 			conditions = append(conditions, fmt.Sprintf("%s >= TIMESTAMP('%s')", quoteIdentifier(opts.IncrementalKey), opts.IntervalStart.Format("2006-01-02T15:04:05Z")))
