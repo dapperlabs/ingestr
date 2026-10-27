@@ -872,6 +872,13 @@ func (d *PostgresDestination) resolveSchemaTable(ctx context.Context, queryer po
 	if err != nil {
 		return "", "", err
 	}
+	// Unquote the parts: `public."Breaks"` splits with the quotes intact, and
+	// downstream comparisons against pg_class.relname (which stores the bare
+	// name) silently no-op when the quotes leak through — the mixed-case
+	// generated-column skip bug. The resolution must return bare identifiers.
+	for i, p := range parts {
+		parts[i] = strings.Trim(p, `"`)
+	}
 	if len(parts) == 2 {
 		return parts[0], parts[1], nil
 	}
