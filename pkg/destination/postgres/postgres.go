@@ -872,13 +872,6 @@ func (d *PostgresDestination) resolveSchemaTable(ctx context.Context, queryer po
 	if err != nil {
 		return "", "", err
 	}
-	// Unquote the parts: `public."Breaks"` splits with the quotes intact, and
-	// downstream comparisons against pg_class.relname (which stores the bare
-	// name) silently no-op when the quotes leak through — the mixed-case
-	// generated-column skip bug. The resolution must return bare identifiers.
-	for i, p := range parts {
-		parts[i] = strings.Trim(p, `"`)
-	}
 	if len(parts) == 2 {
 		return parts[0], parts[1], nil
 	}
@@ -902,6 +895,7 @@ func (d *PostgresDestination) resolveSchemaTable(ctx context.Context, queryer po
 	}
 	return schemaName, tableName, nil
 }
+
 
 func (d *PostgresDestination) Exec(ctx context.Context, sql string, args ...any) error {
 	_, err := d.pool.Exec(ctx, sql, args...)
@@ -2194,11 +2188,16 @@ func buildCreateTableSQL(table string, columns []schema.Column, primaryKeys []st
 }
 
 func parseTableIdentifier(table string) pgx.Identifier {
-	parts := strings.SplitN(table, ".", 2)
-	if len(parts) == 2 {
-		return pgx.Identifier{parts[0], parts[1]}
+	// tablename.Split honors identifier quoting (unlike strings.SplitN) and
+	// returns bare parts — a quoted mixed-case target like public."Breaks"
+	// becomes {public, Breaks}, which pgx.Identifier.Sanitize re-quotes
+	// correctly. Splitting naively keeps the quote characters inside the part,
+	// and Sanitize then double-quotes them into a name no relation has.
+	parts := tablename.Split(table)
+	for i, p := range parts {
+		parts[i] = strings.Trim(p, `"`)
 	}
-	return pgx.Identifier{table}
+	return pgx.Identifier(parts)
 }
 
 func (d *PostgresDestination) ListStagingTables(ctx context.Context, schema, prefix string) ([]string, error) {
