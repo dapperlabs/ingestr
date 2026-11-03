@@ -352,6 +352,9 @@ func TestApplyContract_RemovedColumn_Evolve(t *testing.T) {
 }
 
 func TestApplyContract_RemovedColumn_Freeze(t *testing.T) {
+	// A destination-only column is not drift: the source never fills it.
+	// Freeze allows it (forward-evolved destination schemas); type changes and
+	// source-only columns still violate.
 	comparison := &SchemaComparison{
 		HasChanges: true,
 		Changes: []SchemaChange{
@@ -362,10 +365,9 @@ func TestApplyContract_RemovedColumn_Freeze(t *testing.T) {
 	contract := SchemaContract{Mode: ContractFreeze}
 	result := ApplyContract(contract, comparison)
 
-	assert.True(t, result.HasViolations())
-	assert.Empty(t, result.Allowed)
-	assert.Len(t, result.Violations, 1)
-	assert.Contains(t, result.Violations[0].Description, "removed from source")
+	assert.False(t, result.HasViolations())
+	assert.Len(t, result.Allowed, 1)
+	assert.Equal(t, "old_col", result.Allowed[0].ColumnName)
 }
 
 func TestApplyContract_RemovedColumn_DiscardRow(t *testing.T) {

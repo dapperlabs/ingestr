@@ -59,7 +59,12 @@ func ApplyContract(contract SchemaContract, comparison *SchemaComparison) *Contr
 
 	case ContractFreeze:
 		for _, change := range comparison.Changes {
-			if isInternalAllowedChange(change) {
+			// A column present only in the destination (target-superset) is not
+			// drift: the source simply never fills it (it defaults). Allow it so
+			// forward-evolved destination schemas (e.g. gorm models with new
+			// fields the Spanner source never had) pass the freeze; type changes
+			// and source-only columns still hard-fail.
+			if change.Type == ChangeRemoveColumn || isInternalAllowedChange(change) {
 				result.Allowed = append(result.Allowed, change)
 				continue
 			}

@@ -43,12 +43,16 @@ func (s *postgresStatementDescriberStub) Prepare(_ context.Context, name, sql st
 
 type postgresResolverStub struct {
 	query  string
+	arg0   string
 	schema string
 	table  string
 }
 
-func (s *postgresResolverStub) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+func (s *postgresResolverStub) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
 	s.query = query
+	if len(args) > 0 {
+		s.arg0, _ = args[0].(string)
+	}
 	return postgresResolverRow{schema: s.schema, table: s.table}
 }
 
@@ -127,6 +131,35 @@ func TestResolveSchemaTableUsesSearchPathForUnqualifiedTarget(t *testing.T) {
 	}
 	if !strings.Contains(resolver.query, "to_regclass($1)") || !strings.Contains(resolver.query, "current_schema()") {
 		t.Fatalf("resolver query does not honor existing table resolution and search_path: %s", resolver.query)
+	}
+}
+
+func TestParseTableIdentifierQuotedMixedCase(t *testing.T) {
+	// FORK-KNOWN-ISSUES #1's write-path twin: a quoted schema-qualified target
+	// must become bare parts — the naive SplitN kept quote characters inside the
+	// identifier, and Sanitize double-quoted them into a name no relation has
+	// (observed as relation "public."Nfts"" does not exist on generated-column
+	// tables, 2026-10-27).
+	for input, want := range map[string][]string{
+		`public."Breaks"`: {"public", "Breaks"},
+		`public.breaks`:   {"public", "breaks"},
+		`Breaks`:          {"Breaks"},
+	} {
+		ident := parseTableIdentifier(input)
+		if len(ident) != len(want) {
+			t.Fatalf("%s: got %v", input, ident)
+		}
+		for i, w := range want {
+			if ident[i] != w {
+				t.Fatalf("%s: part %d = %q, want %q", input, i, ident[i], w)
+			}
+		}
+		// and the sanitized SQL form must be the normally-quoted qualified name
+		got := ident.Sanitize()
+		exp := `"` + strings.Join(want, `"."`) + `"`
+		if got != exp {
+			t.Fatalf("%s: Sanitize() = %q, want %q", input, got, exp)
+		}
 	}
 }
 
