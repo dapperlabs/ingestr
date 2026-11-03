@@ -19,6 +19,7 @@ URI parameters:
 - `project_id`: Your Google Cloud project ID (e.g., "my-project-123")
 - `instance_id`: The Spanner instance ID (e.g., "my-instance")
 - `database`: The database name (e.g., "my-database")
+- `dialect`: The SQL dialect of the database: `google_standard_sql` (default) or `postgresql`. Set `postgresql` for a database created with `database_dialect = "POSTGRESQL"`, otherwise the source emits GoogleSQL and the database rejects it.
 - `credentials_path`: Path to your Google Cloud service account JSON file
 - `credentials_base64`: Base64-encoded service account credentials (alternative to credentials_path)
 
@@ -36,6 +37,6 @@ ingestr ingest \
 <img alt="GCP Spanner Ingestion Example" src="../media/gcp_spanner_ingestion.png"/>
 
 > [!NOTE]
-> Currently, only GoogleSQL databases are supported.
+> GoogleSQL databases are read by default. PostgreSQL-dialect databases need `dialect=postgresql` in the source URI; the dialect is not auto-detected.
 
 

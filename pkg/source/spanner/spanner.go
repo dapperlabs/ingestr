@@ -29,8 +29,15 @@ import (
 var silentLogger = log.New(io.Discard, "", 0)
 
 type SpannerSource struct {
-	client       *spanner.Client
-	dbPath       string
+	client *spanner.Client
+	dbPath string
+	// dialect selects the SQL syntax emitted for this database. A Spanner
+	// database is created with either GoogleSQL or PostgreSQL syntax, and the
+	// client library does not translate between them: identifier quoting,
+	// statement parameters and timestamp literals all differ. The zero value
+	// means GoogleSQL, so a source built without the URI param behaves exactly
+	// as it did before the option existed.
+	dialect Dialect
 	// readPriority and exactStaleness shape the bulk-read path only (the data
 	// read in read()); schema/metadata reads stay default-priority strong.
 	// The atlas production copy needs both: the consumer DB runs at p95 76%
@@ -55,13 +62,14 @@ func (s *SpannerSource) Schemes() []string {
 }
 
 func (s *SpannerSource) Connect(ctx context.Context, uri string) error {
-	dbPath, opts, readPriority, exactStaleness, dataBoost, err := parseURI(uri)
+	dbPath, opts, readPriority, exactStaleness, dataBoost, dialect, err := parseURI(uri)
 	if err != nil {
 		return err
 	}
 	s.readPriority = readPriority
 	s.exactStaleness = exactStaleness
 	s.dataBoost = dataBoost
+	s.dialect = dialect
 
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, spanner.ClientConfig{Logger: silentLogger}, opts...)
 	if err != nil {
@@ -183,7 +191,7 @@ func mergeDeclaredLengths(queryCols, infoCols []schema.Column) []schema.Column {
 }
 
 func (s *SpannerSource) getSchemaFromQuery(ctx context.Context, table string) ([]schema.Column, error) {
-	query := fmt.Sprintf("SELECT * FROM %s LIMIT 1", quoteIdentifier(table))
+	query := fmt.Sprintf("SELECT * FROM %s LIMIT 1", s.dialect.quoteIdentifier(table))
 	iter := s.client.Single().Query(ctx, spanner.NewStatement(query))
 	defer iter.Stop()
 
@@ -220,16 +228,27 @@ func (s *SpannerSource) getSchemaFromQuery(ctx context.Context, table string) ([
 	return columns, nil
 }
 
-func (s *SpannerSource) getSchemaFromInfoSchema(ctx context.Context, table string) ([]schema.Column, error) {
-	query := `SELECT COLUMN_NAME, SPANNER_TYPE, IS_NULLABLE, ORDINAL_POSITION
-		FROM INFORMATION_SCHEMA.COLUMNS
-		WHERE TABLE_NAME = @table
-		ORDER BY ORDINAL_POSITION`
-
-	stmt := spanner.Statement{
-		SQL:    query,
-		Params: map[string]interface{}{"table": table},
+// infoSchemaStmt builds a single-parameter statement over INFORMATION_SCHEMA.
+// The format string must contain exactly one verb, in the position where the
+// table name is bound: the placeholder differs per dialect (GoogleSQL @table,
+// PostgreSQL $1), as does the name the value is bound under.
+func (s *SpannerSource) infoSchemaStmt(format, table string) spanner.Statement {
+	placeholder, paramName := s.dialect.bindParam("table", 1)
+	return spanner.Statement{
+		SQL:    fmt.Sprintf(format, placeholder),
+		Params: map[string]interface{}{paramName: table},
 	}
+}
+
+func (s *SpannerSource) getSchemaFromInfoSchema(ctx context.Context, table string) ([]schema.Column, error) {
+	// SPANNER_TYPE exists in both dialects' information_schema — PostgreSQL
+	// spells it spanner_type and folds unquoted identifiers to lower case, so
+	// the GoogleSQL spelling resolves there too — but its values are spelled in
+	// the dialect's own type names (see mapSpannerTypeString).
+	stmt := s.infoSchemaStmt(`SELECT COLUMN_NAME, SPANNER_TYPE, IS_NULLABLE, ORDINAL_POSITION
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_NAME = %s
+		ORDER BY ORDINAL_POSITION`, table)
 
 	iter := s.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -283,6 +302,13 @@ func mapSpannerTypeString(spannerType string) (schema.DataType, int, int, int, s
 		return schema.TypeArray, precision, scale, elemLen, elemType
 	}
 
+	// A PostgreSQL-dialect database spells the same type with a trailing []
+	// (bigint[], character varying(36)[]) instead of the ARRAY<...> wrapper.
+	if strings.HasSuffix(upper, "[]") {
+		elemType, precision, scale, elemLen, _ := mapSpannerTypeString(strings.TrimSuffix(upper, "[]"))
+		return schema.TypeArray, precision, scale, elemLen, elemType
+	}
+
 	base := upper
 	maxLength := 0
 	if idx := strings.Index(upper, "("); idx != -1 {
@@ -295,41 +321,47 @@ func mapSpannerTypeString(spannerType string) (schema.DataType, int, int, int, s
 		}
 	}
 
+	// The PostgreSQL dialect reports spanner_type in PostgreSQL DDL spelling
+	// (varchar(36) arrives as "character varying(36)", int64 as "bigint", …),
+	// so both dialects' names are accepted here. An unknown name still falls
+	// through to string rather than failing the read.
 	switch base {
-	case "BOOL":
+	case "BOOL", "BOOLEAN":
 		return schema.TypeBoolean, 0, 0, 0, schema.TypeUnknown
-	case "INT64":
+	case "INT64", "BIGINT", "INT8":
 		return schema.TypeInt64, 0, 0, 0, schema.TypeUnknown
-	case "FLOAT32":
+	case "FLOAT32", "FLOAT4", "REAL":
 		return schema.TypeFloat32, 0, 0, 0, schema.TypeUnknown
-	case "FLOAT64":
+	case "FLOAT64", "FLOAT8", "DOUBLE PRECISION":
 		return schema.TypeFloat64, 0, 0, 0, schema.TypeUnknown
-	case "NUMERIC":
+	case "NUMERIC", "DECIMAL":
 		return schema.TypeDecimal, 38, 9, 0, schema.TypeUnknown
-	case "STRING":
+	case "STRING", "CHARACTER VARYING", "VARCHAR", "CHARACTER", "CHAR", "TEXT":
 		return schema.TypeString, 0, 0, maxLength, schema.TypeUnknown
-	case "BYTES":
+	case "BYTES", "BYTEA":
 		return schema.TypeBinary, 0, 0, maxLength, schema.TypeUnknown
 	case "DATE":
 		return schema.TypeDate, 0, 0, 0, schema.TypeUnknown
-	case "TIMESTAMP":
+	case "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE":
 		return schema.TypeTimestampTZ, 0, 0, 0, schema.TypeUnknown
-	case "JSON":
+	case "JSON", "JSONB":
 		return schema.TypeJSON, 0, 0, 0, schema.TypeUnknown
+	case "UUID":
+		return schema.TypeUUID, 0, 0, 0, schema.TypeUnknown
+	case "INTERVAL":
+		return schema.TypeInterval, 0, 0, 0, schema.TypeUnknown
+	case "OID":
+		// Spanner's PostgreSQL OID is an INT64 carrying the PG_OID annotation.
+		return schema.TypeInt64, 0, 0, 0, schema.TypeUnknown
 	default:
 		return schema.TypeString, 0, 0, 0, schema.TypeUnknown
 	}
 }
 
 func (s *SpannerSource) fetchNullability(ctx context.Context, table string) map[string]bool {
-	query := `SELECT COLUMN_NAME, IS_NULLABLE
+	stmt := s.infoSchemaStmt(`SELECT COLUMN_NAME, IS_NULLABLE
 		FROM INFORMATION_SCHEMA.COLUMNS
-		WHERE TABLE_NAME = @table`
-
-	stmt := spanner.Statement{
-		SQL:    query,
-		Params: map[string]interface{}{"table": table},
-	}
+		WHERE TABLE_NAME = %s`, table)
 
 	iter := s.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -354,16 +386,11 @@ func (s *SpannerSource) fetchNullability(ctx context.Context, table string) map[
 }
 
 func (s *SpannerSource) fetchPrimaryKeys(ctx context.Context, table string) []string {
-	query := `SELECT COLUMN_NAME
+	stmt := s.infoSchemaStmt(`SELECT COLUMN_NAME
 		FROM INFORMATION_SCHEMA.INDEX_COLUMNS
-		WHERE TABLE_NAME = @table
+		WHERE TABLE_NAME = %s
 			AND INDEX_NAME = 'PRIMARY_KEY'
-		ORDER BY ORDINAL_POSITION`
-
-	stmt := spanner.Statement{
-		SQL:    query,
-		Params: map[string]interface{}{"table": table},
-	}
+		ORDER BY ORDINAL_POSITION`, table)
 
 	iter := s.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -411,7 +438,7 @@ func (s *SpannerSource) read(ctx context.Context, table string, tableSchema *sch
 	go func() {
 		defer close(results)
 
-		query := buildSelectQuery(table, columns, opts)
+		query := buildSelectQuery(s.dialect, table, columns, opts)
 		config.Debug("[SPANNER] Executing query: %s", query)
 
 		// Bulk reads get the configured priority/staleness; schema and metadata
@@ -920,10 +947,10 @@ func (s *SpannerSource) ExecuteCustomQuery(ctx context.Context, query string, op
 	return results, nil
 }
 
-func parseURI(uri string) (string, []option.ClientOption, string, time.Duration, bool, error) {
+func parseURI(uri string) (string, []option.ClientOption, string, time.Duration, bool, Dialect, error) {
 	parsed, err := url.Parse(uri)
 	if err != nil {
-		return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: %w", err)
+		return "", nil, "", 0, false, "", fmt.Errorf("invalid Spanner URI: %w", err)
 	}
 
 	query := parsed.Query()
@@ -932,7 +959,7 @@ func parseURI(uri string) (string, []option.ClientOption, string, time.Duration,
 	database := query.Get("database")
 
 	if projectID == "" || instanceID == "" || database == "" {
-		return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: project_id, instance_id, and database are required, e.g. spanner://?project_id=PROJECT&instance_id=INSTANCE&database=DATABASE")
+		return "", nil, "", 0, false, "", fmt.Errorf("invalid Spanner URI: project_id, instance_id, and database are required, e.g. spanner://?project_id=PROJECT&instance_id=INSTANCE&database=DATABASE")
 	}
 
 	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, database)
@@ -941,15 +968,20 @@ func parseURI(uri string) (string, []option.ClientOption, string, time.Duration,
 	switch readPriority {
 	case "", "high", "low":
 	default:
-		return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: read_priority must be high or low")
+		return "", nil, "", 0, false, "", fmt.Errorf("invalid Spanner URI: read_priority must be high or low")
 	}
 	dataBoost := query.Get("data_boost") == "true"
+
+	dialect, err := parseDialect(query.Get("dialect"))
+	if err != nil {
+		return "", nil, "", 0, false, "", err
+	}
 
 	var exactStaleness time.Duration
 	if raw := query.Get("exact_staleness"); raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil || d < 0 {
-			return "", nil, "", 0, false, fmt.Errorf("invalid Spanner URI: exact_staleness must be a Go duration like 60s")
+			return "", nil, "", 0, false, "", fmt.Errorf("invalid Spanner URI: exact_staleness must be a Go duration like 60s")
 		}
 		exactStaleness = d
 	}
@@ -958,22 +990,22 @@ func parseURI(uri string) (string, []option.ClientOption, string, time.Duration,
 	if credPath := query.Get("credentials_path"); credPath != "" {
 		opt, err := credentialsFileOption(credPath)
 		if err != nil {
-			return "", nil, "", 0, false, err
+			return "", nil, "", 0, false, "", err
 		}
 		opts = append(opts, opt)
 	} else if credBase64 := query.Get("credentials_base64"); credBase64 != "" {
 		credJSON, err := base64.StdEncoding.DecodeString(credBase64)
 		if err != nil {
-			return "", nil, "", 0, false, fmt.Errorf("failed to decode credentials_base64: %w", err)
+			return "", nil, "", 0, false, "", fmt.Errorf("failed to decode credentials_base64: %w", err)
 		}
 		opt, err := credentialsJSONOption(credJSON)
 		if err != nil {
-			return "", nil, "", 0, false, err
+			return "", nil, "", 0, false, "", err
 		}
 		opts = append(opts, opt)
 	}
 
-	return dbPath, opts, readPriority, exactStaleness, dataBoost, nil
+	return dbPath, opts, readPriority, exactStaleness, dataBoost, dialect, nil
 }
 
 // credentialsFileOption builds the client option for a credentials file whose
@@ -1038,30 +1070,96 @@ func buildArrowSchema(columns []schema.Column) *arrow.Schema {
 	return arrow.NewSchema(fields, nil)
 }
 
-func quoteIdentifier(name string) string {
+// Dialect is the SQL dialect of a Spanner database. A database is created with
+// either GoogleSQL or PostgreSQL syntax and the client library does not
+// translate between them, so every construct this source emits has to follow
+// the database it talks to.
+type Dialect string
+
+const (
+	DialectGoogleSQL  Dialect = "google_standard_sql"
+	DialectPostgreSQL Dialect = "postgresql"
+)
+
+// parseDialect validates the URI's dialect param. An absent param is GoogleSQL:
+// every database created before this option existed is GoogleSQL, so existing
+// URIs must keep behaving exactly as they did.
+func parseDialect(raw string) (Dialect, error) {
+	switch Dialect(strings.ToLower(strings.TrimSpace(raw))) {
+	case "", DialectGoogleSQL:
+		return DialectGoogleSQL, nil
+	case DialectPostgreSQL:
+		return DialectPostgreSQL, nil
+	default:
+		return "", fmt.Errorf("invalid Spanner URI: dialect must be %s or %s", DialectGoogleSQL, DialectPostgreSQL)
+	}
+}
+
+// normalize maps the zero value — a source that never went through Connect, or
+// a URI without the param — onto GoogleSQL.
+func (d Dialect) normalize() Dialect {
+	if d == "" {
+		return DialectGoogleSQL
+	}
+	return d
+}
+
+// quoteIdentifier quotes an identifier for the dialect: GoogleSQL delimits with
+// backticks, the PostgreSQL dialect with double quotes. Both escape the
+// delimiter by doubling it. The PostgreSQL dialect folds *unquoted* identifiers
+// to lower case, so quoting is what preserves the caller's spelling exactly —
+// pass names the way the database stores them.
+func (d Dialect) quoteIdentifier(name string) string {
+	if d.normalize() == DialectPostgreSQL {
+		return fmt.Sprintf(`"%s"`, strings.ReplaceAll(name, `"`, `""`))
+	}
 	return fmt.Sprintf("`%s`", strings.ReplaceAll(name, "`", "``"))
 }
 
-func buildSelectQuery(table string, columns []schema.Column, opts source.ReadOptions) string {
+// bindParam renders the placeholder for a statement parameter and returns the
+// name its value must be bound under. GoogleSQL placeholders are named
+// (@table); the PostgreSQL dialect binds positionally ($1, $2, …) and the
+// Spanner API names the nth positional parameter "pn". Position is 1-based.
+func (d Dialect) bindParam(name string, position int) (placeholder, paramName string) {
+	if d.normalize() == DialectPostgreSQL {
+		return fmt.Sprintf("$%d", position), fmt.Sprintf("p%d", position)
+	}
+	return "@" + name, name
+}
+
+// timestampLiteral renders a timestamp as a SQL literal. The PostgreSQL dialect
+// has no TIMESTAMP(...) function — that is GoogleSQL syntax and a parse error
+// there — and its only timestamp type is timestamptz (a bare TIMESTAMP literal
+// resolves to "timestamp without time zone", which the dialect does not
+// support), so the typed literal carries the timezone-aware type name.
+func (d Dialect) timestampLiteral(t time.Time) string {
+	stamp := t.Format("2006-01-02T15:04:05Z")
+	if d.normalize() == DialectPostgreSQL {
+		return fmt.Sprintf("TIMESTAMPTZ '%s'", stamp)
+	}
+	return fmt.Sprintf("TIMESTAMP('%s')", stamp)
+}
+
+func buildSelectQuery(dialect Dialect, table string, columns []schema.Column, opts source.ReadOptions) string {
 	colNames := make([]string, len(columns))
 	for i, col := range columns {
-		colNames[i] = quoteIdentifier(col.Name)
+		colNames[i] = dialect.quoteIdentifier(col.Name)
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(colNames, ", "), quoteIdentifier(table))
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(colNames, ", "), dialect.quoteIdentifier(table))
 
 	var conditions []string
 	if opts.ExtractPartitionBy != "" {
-		col := quoteIdentifier(opts.ExtractPartitionBy)
+		col := dialect.quoteIdentifier(opts.ExtractPartitionBy)
 		if opts.ExtractPartitionStart != nil {
-			conditions = append(conditions, fmt.Sprintf("%s >= TIMESTAMP('%s')", col, opts.ExtractPartitionStart.Format("2006-01-02T15:04:05Z")))
+			conditions = append(conditions, fmt.Sprintf("%s >= %s", col, dialect.timestampLiteral(*opts.ExtractPartitionStart)))
 		}
 		if opts.ExtractPartitionEnd != nil {
 			op := "<="
 			if !opts.ExtractPartitionEndInclusive {
 				op = "<"
 			}
-			conditions = append(conditions, fmt.Sprintf("%s %s TIMESTAMP('%s')", col, op, opts.ExtractPartitionEnd.Format("2006-01-02T15:04:05Z")))
+			conditions = append(conditions, fmt.Sprintf("%s %s %s", col, op, dialect.timestampLiteral(*opts.ExtractPartitionEnd)))
 		}
 		if opts.ExtractPartitionNumericStart != nil {
 			conditions = append(conditions, fmt.Sprintf("%s >= %d", col, *opts.ExtractPartitionNumericStart))
@@ -1079,10 +1177,10 @@ func buildSelectQuery(table string, columns []schema.Column, opts source.ReadOpt
 	}
 	if opts.IncrementalKey != "" {
 		if opts.IntervalStart != nil {
-			conditions = append(conditions, fmt.Sprintf("%s >= TIMESTAMP('%s')", quoteIdentifier(opts.IncrementalKey), opts.IntervalStart.Format("2006-01-02T15:04:05Z")))
+			conditions = append(conditions, fmt.Sprintf("%s >= %s", dialect.quoteIdentifier(opts.IncrementalKey), dialect.timestampLiteral(*opts.IntervalStart)))
 		}
 		if opts.IntervalEnd != nil {
-			conditions = append(conditions, fmt.Sprintf("%s <= TIMESTAMP('%s')", quoteIdentifier(opts.IncrementalKey), opts.IntervalEnd.Format("2006-01-02T15:04:05Z")))
+			conditions = append(conditions, fmt.Sprintf("%s <= %s", dialect.quoteIdentifier(opts.IncrementalKey), dialect.timestampLiteral(*opts.IntervalEnd)))
 		}
 	}
 

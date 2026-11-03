@@ -87,7 +87,7 @@ func TestParseURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dbPath, opts, _, _, _, err := parseURI(tt.uri)
+			dbPath, opts, _, _, _, _, err := parseURI(tt.uri)
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errContain)
@@ -281,7 +281,7 @@ func TestBuildSelectQuery(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildSelectQuery(tt.table, columns, tt.opts)
+			got := buildSelectQuery(DialectGoogleSQL, tt.table, columns, tt.opts)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -398,17 +398,17 @@ func (f columnGetterFunc) Column(idx int, ptr interface{}) error { return f(idx,
 
 func TestParseURIReadControls(t *testing.T) {
 	// read_priority validates; exact_staleness parses as a Go duration.
-	_, _, prio, stale, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=low&exact_staleness=60s")
+	_, _, prio, stale, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=low&exact_staleness=60s")
 	if err != nil {
 		t.Fatalf("valid controls: %v", err)
 	}
 	if prio != "low" || stale != time.Minute {
 		t.Fatalf("got priority=%q staleness=%v", prio, stale)
 	}
-	if _, _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=urgent"); err == nil {
+	if _, _, _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&read_priority=urgent"); err == nil {
 		t.Fatal("bogus read_priority must fail loudly")
 	}
-	if _, _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&exact_staleness=soon"); err == nil {
+	if _, _, _, _, _, _, err := parseURI("spanner://?project_id=p&instance_id=i&database=d&exact_staleness=soon"); err == nil {
 		t.Fatal("unparsable exact_staleness must fail loudly")
 	}
 }
@@ -421,7 +421,7 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 	start := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
 	end := start.Add(time.Hour)
 
-	q := buildSelectQuery("Deposits", cols, source.ReadOptions{
+	q := buildSelectQuery(DialectGoogleSQL, "Deposits", cols, source.ReadOptions{
 		ExtractPartitionBy:   "DepositedAt",
 		ExtractPartitionStart: &start,
 		ExtractPartitionEnd:   &end,
@@ -432,7 +432,7 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 	}
 
 	// inclusive end (the last window must not drop the boundary row)
-	q = buildSelectQuery("Deposits", cols, source.ReadOptions{
+	q = buildSelectQuery(DialectGoogleSQL, "Deposits", cols, source.ReadOptions{
 		ExtractPartitionBy:           "DepositedAt",
 		ExtractPartitionStart:         &start,
 		ExtractPartitionEnd:           &end,
@@ -444,7 +444,7 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 
 	// numeric window
 	lo, hi := int64(1000), int64(2000)
-	q = buildSelectQuery("Quests", cols, source.ReadOptions{
+	q = buildSelectQuery(DialectGoogleSQL, "Quests", cols, source.ReadOptions{
 		ExtractPartitionBy:           "SerialNumber",
 		ExtractPartitionNumericStart: &lo,
 		ExtractPartitionNumericEnd:   &hi,
@@ -454,7 +454,7 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 	}
 
 	// the null window
-	q = buildSelectQuery("Quests", cols, source.ReadOptions{
+	q = buildSelectQuery(DialectGoogleSQL, "Quests", cols, source.ReadOptions{
 		ExtractPartitionBy:     "SerialNumber",
 		ExtractPartitionIsNull: true,
 	})
@@ -468,7 +468,7 @@ func TestBuildSelectQueryUnpartitionedIsUnchanged(t *testing.T) {
 	// partition machinery — a stray filter there is silent data loss, not a
 	// crash.
 	cols := []schema.Column{{Name: "Id", DataType: schema.TypeString}, {Name: "CreatedAt", DataType: schema.TypeTimestampTZ}}
-	got := buildSelectQuery("Actions", cols, source.ReadOptions{})
+	got := buildSelectQuery(DialectGoogleSQL, "Actions", cols, source.ReadOptions{})
 	want := "SELECT `Id`, `CreatedAt` FROM `Actions`"
 	if got != want {
 		t.Fatalf("unpartitioned query changed:\n got %s\nwant %s", got, want)
@@ -737,6 +737,238 @@ func TestArrayValuesNilSliceStaysNull(t *testing.T) {
 	got, err := extractColumnValue(row, 0, col)
 	require.NoError(t, err)
 	assert.Nil(t, got)
+}
+
+func TestDialectQuoteIdentifier(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect Dialect
+		input   string
+		want    string
+	}{
+		{"googlesql plain", DialectGoogleSQL, "created_at", "`created_at`"},
+		{"googlesql embedded backtick", DialectGoogleSQL, "we`ird", "`we``ird`"},
+		{"googlesql leaves double quote alone", DialectGoogleSQL, `we"ird`, "`we\"ird`"},
+		{"postgres plain", DialectPostgreSQL, "created_at", `"created_at"`},
+		{"postgres embedded double quote", DialectPostgreSQL, `we"ird`, `"we""ird"`},
+		{"postgres leaves backtick alone", DialectPostgreSQL, "we`ird", "\"we`ird\""},
+		{"postgres mixed case is preserved", DialectPostgreSQL, "Deposits", `"Deposits"`},
+		{"zero value behaves as googlesql", "", "created_at", "`created_at`"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.dialect.quoteIdentifier(tt.input))
+		})
+	}
+}
+
+func TestDialectBindParam(t *testing.T) {
+	tests := []struct {
+		name            string
+		dialect         Dialect
+		param           string
+		position        int
+		wantPlaceholder string
+		wantParamName   string
+	}{
+		{"googlesql is named", DialectGoogleSQL, "table", 1, "@table", "table"},
+		{"googlesql ignores position", DialectGoogleSQL, "table", 2, "@table", "table"},
+		{"postgres is positional", DialectPostgreSQL, "table", 1, "$1", "p1"},
+		{"postgres second parameter", DialectPostgreSQL, "table", 2, "$2", "p2"},
+		{"zero value behaves as googlesql", "", "table", 1, "@table", "table"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			placeholder, paramName := tt.dialect.bindParam(tt.param, tt.position)
+			assert.Equal(t, tt.wantPlaceholder, placeholder)
+			assert.Equal(t, tt.wantParamName, paramName)
+		})
+	}
+}
+
+func TestDialectTimestampLiteral(t *testing.T) {
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	assert.Equal(t, "TIMESTAMP('2024-01-01T00:00:00Z')", DialectGoogleSQL.timestampLiteral(ts))
+	// The PostgreSQL dialect has no TIMESTAMP(...) function, and a bare
+	// TIMESTAMP literal resolves to "timestamp without time zone" — a type the
+	// dialect does not have. The typed literal carries timestamptz.
+	assert.Equal(t, "TIMESTAMPTZ '2024-01-01T00:00:00Z'", DialectPostgreSQL.timestampLiteral(ts))
+	assert.Equal(t, "TIMESTAMP('2024-01-01T00:00:00Z')", Dialect("").timestampLiteral(ts))
+}
+
+func TestBuildSelectQueryPostgreSQL(t *testing.T) {
+	columns := []schema.Column{
+		{Name: "id", DataType: schema.TypeInt64},
+		{Name: "created_at", DataType: schema.TypeTimestampTZ},
+	}
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC)
+
+	tests := []struct {
+		name  string
+		table string
+		opts  source.ReadOptions
+		want  string
+	}{
+		{
+			name:  "basic select",
+			table: "usd_withdrawals",
+			opts:  source.ReadOptions{},
+			want:  `SELECT "id", "created_at" FROM "usd_withdrawals"`,
+		},
+		{
+			name:  "incremental key with both intervals",
+			table: "usd_withdrawals",
+			opts: source.ReadOptions{
+				IncrementalKey: "created_at",
+				IntervalStart:  &start,
+				IntervalEnd:    &end,
+			},
+			want: `SELECT "id", "created_at" FROM "usd_withdrawals" WHERE "created_at" >= TIMESTAMPTZ '2024-01-01T00:00:00Z' AND "created_at" <= TIMESTAMPTZ '2024-12-31T23:59:59Z'`,
+		},
+		{
+			name:  "partition window",
+			table: "usd_withdrawals",
+			opts: source.ReadOptions{
+				ExtractPartitionBy:    "created_at",
+				ExtractPartitionStart: &start,
+				ExtractPartitionEnd:   &end,
+				Limit:                 50,
+			},
+			want: `SELECT "id", "created_at" FROM "usd_withdrawals" WHERE "created_at" >= TIMESTAMPTZ '2024-01-01T00:00:00Z' AND "created_at" < TIMESTAMPTZ '2024-12-31T23:59:59Z' LIMIT 50`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, buildSelectQuery(DialectPostgreSQL, tt.table, columns, tt.opts))
+		})
+	}
+}
+
+func TestParseURIDialect(t *testing.T) {
+	base := "spanner://?project_id=p&instance_id=i&database=d"
+
+	tests := []struct {
+		name       string
+		uri        string
+		want       Dialect
+		wantErr    bool
+		errContain string
+	}{
+		{name: "default is googlesql", uri: base, want: DialectGoogleSQL},
+		{name: "explicit googlesql", uri: base + "&dialect=google_standard_sql", want: DialectGoogleSQL},
+		{name: "postgresql", uri: base + "&dialect=postgresql", want: DialectPostgreSQL},
+		{name: "case insensitive", uri: base + "&dialect=PostgreSQL", want: DialectPostgreSQL},
+		{
+			name:       "unknown value is rejected",
+			uri:        base + "&dialect=mysql",
+			wantErr:    true,
+			errContain: "dialect must be google_standard_sql or postgresql",
+		},
+		{
+			// A near-miss spelling is a tempting typo; it must fail loudly
+			// rather than silently read the database as GoogleSQL.
+			name:       "near-miss value is rejected",
+			uri:        base + "&dialect=postgres",
+			wantErr:    true,
+			errContain: "dialect must be google_standard_sql or postgresql",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, _, dialect, err := parseURI(tt.uri)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errContain)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, dialect)
+		})
+	}
+}
+
+func TestGoogleSQLOutputUnchanged(t *testing.T) {
+	// Pins the exact bytes the atlas production path has always sent. A change
+	// to any of these strings means the default path is no longer byte-identical
+	// to what runs in production today.
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	assert.Equal(t, "`we``ird`", DialectGoogleSQL.quoteIdentifier("we`ird"))
+	assert.Equal(t, "`plain`", DialectGoogleSQL.quoteIdentifier("plain"))
+
+	placeholder, paramName := DialectGoogleSQL.bindParam("table", 1)
+	assert.Equal(t, "@table", placeholder)
+	assert.Equal(t, "table", paramName)
+
+	assert.Equal(t, "TIMESTAMP('2024-01-01T00:00:00Z')", DialectGoogleSQL.timestampLiteral(ts))
+
+	columns := []schema.Column{
+		{Name: "Id", DataType: schema.TypeString},
+		{Name: "CreatedAt", DataType: schema.TypeTimestampTZ},
+	}
+	got := buildSelectQuery(DialectGoogleSQL, "Actions", columns, source.ReadOptions{
+		IncrementalKey: "CreatedAt",
+		IntervalStart:  &ts,
+	})
+	want := "SELECT `Id`, `CreatedAt` FROM `Actions` WHERE `CreatedAt` >= TIMESTAMP('2024-01-01T00:00:00Z')"
+	assert.Equal(t, want, got)
+}
+
+func TestInfoSchemaStmtDialect(t *testing.T) {
+	format := `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = %s`
+
+	googleSQL := (&SpannerSource{dialect: DialectGoogleSQL}).infoSchemaStmt(format, "Deposits")
+	assert.Contains(t, googleSQL.SQL, "TABLE_NAME = @table")
+	assert.Equal(t, map[string]interface{}{"table": "Deposits"}, googleSQL.Params)
+
+	// The PostgreSQL dialect rejects @name placeholders outright ("syntax error
+	// at or near ..."), so the bound name has to move to the pn convention too.
+	postgres := (&SpannerSource{dialect: DialectPostgreSQL}).infoSchemaStmt(format, "deposits")
+	assert.Contains(t, postgres.SQL, "TABLE_NAME = $1")
+	assert.Equal(t, map[string]interface{}{"p1": "deposits"}, postgres.Params)
+}
+
+func TestMapSpannerTypeStringPostgreSQL(t *testing.T) {
+	// Values are what a PostgreSQL-dialect INFORMATION_SCHEMA.COLUMNS reports
+	// for spanner_type; the spellings are the dialect's own DDL names, not
+	// GoogleSQL's, so the fallback path would otherwise read every column as
+	// an unbounded string.
+	tests := []struct {
+		input     string
+		wantType  schema.DataType
+		wantLen   int
+		wantArray schema.DataType
+	}{
+		{"bigint", schema.TypeInt64, 0, schema.TypeUnknown},
+		{"character varying(36)", schema.TypeString, 36, schema.TypeUnknown},
+		{"character varying", schema.TypeString, 0, schema.TypeUnknown},
+		{"text", schema.TypeString, 0, schema.TypeUnknown},
+		{"timestamp with time zone", schema.TypeTimestampTZ, 0, schema.TypeUnknown},
+		{"numeric", schema.TypeDecimal, 0, schema.TypeUnknown},
+		{"boolean", schema.TypeBoolean, 0, schema.TypeUnknown},
+		{"bytea", schema.TypeBinary, 0, schema.TypeUnknown},
+		{"jsonb", schema.TypeJSON, 0, schema.TypeUnknown},
+		{"uuid", schema.TypeUUID, 0, schema.TypeUnknown},
+		{"interval", schema.TypeInterval, 0, schema.TypeUnknown},
+		{"oid", schema.TypeInt64, 0, schema.TypeUnknown},
+		{"bigint[]", schema.TypeArray, 0, schema.TypeInt64},
+		{"character varying(36)[]", schema.TypeArray, 36, schema.TypeString},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			dt, _, _, ml, at := mapSpannerTypeString(tt.input)
+			assert.Equal(t, tt.wantType, dt, "DataType")
+			assert.Equal(t, tt.wantLen, ml, "MaxLength")
+			assert.Equal(t, tt.wantArray, at, "ArrayType")
+		})
+	}
 }
 
 func TestMergeDeclaredLengths(t *testing.T) {
