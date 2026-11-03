@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"strconv"
 	"log"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,7 +122,7 @@ func (s *SpannerSource) GetTable(ctx context.Context, req source.TableRequest) (
 		// fresh Single() snapshot — so a partitioned giant table can never hold
 		// a snapshot past version retention (the Deposits failure class).
 		TableSupportsExtractPartitioning: true,
-		KnownSchema:         true,
+		KnownSchema:                      true,
 		SchemaFn: func(ctx context.Context) (*schema.TableSchema, error) {
 			return tableSchema, nil
 		},
@@ -144,14 +144,21 @@ func (s *SpannerSource) getSchema(ctx context.Context, table string) (*schema.Ta
 	// the declared shape, so lengths (and anything else only it knows) merge
 	// in regardless of which path produced the column list.
 	infoColumns, infoErr := s.getSchemaFromInfoSchema(ctx, table)
-	if infoErr != nil && columns == nil {
+	if infoErr != nil && len(columns) == 0 {
 		return nil, infoErr
 	}
-	if infoErr == nil {
-		columns = mergeDeclaredLengths(columns, infoColumns)
-	}
-	if columns == nil {
+	// len(...) == 0, NOT == nil. mergeDeclaredLengths only copies MaxLength onto
+	// the columns it is given; it does not add the ones only INFORMATION_SCHEMA
+	// knows. On an EMPTY table getSchemaFromQuery returns no rows, so it hands
+	// back a nil slice, and mergeDeclaredLengths(nil, infoColumns) returns
+	// make([]Column, 0) — a NON-NIL empty slice that discards infoColumns
+	// entirely. A `columns == nil` test is therefore false and the fallback
+	// below never fires, leaving the table with zero columns. Everything
+	// downstream then reads every destination column as "removed from source".
+	if len(columns) == 0 {
 		columns = infoColumns
+	} else if infoErr == nil {
+		columns = mergeDeclaredLengths(columns, infoColumns)
 	}
 
 	primaryKeys := s.fetchPrimaryKeys(ctx, table)
@@ -526,11 +533,11 @@ type rowIterator interface {
 // zero draw on the serving instance, not throughput records, and the batch
 // pipeline downstream is the pacer either way.
 type partitionChain struct {
-	ctx    context.Context
-	txn    *spanner.BatchReadOnlyTransaction
-	parts  []*spanner.Partition
-	idx    int
-	iter   *spanner.RowIterator
+	ctx   context.Context
+	txn   *spanner.BatchReadOnlyTransaction
+	parts []*spanner.Partition
+	idx   int
+	iter  *spanner.RowIterator
 }
 
 func (c *partitionChain) Next() (*spanner.Row, error) {

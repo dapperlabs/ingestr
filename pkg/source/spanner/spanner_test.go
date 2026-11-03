@@ -422,7 +422,7 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 	end := start.Add(time.Hour)
 
 	q := buildSelectQuery(DialectGoogleSQL, "Deposits", cols, source.ReadOptions{
-		ExtractPartitionBy:   "DepositedAt",
+		ExtractPartitionBy:    "DepositedAt",
 		ExtractPartitionStart: &start,
 		ExtractPartitionEnd:   &end,
 	})
@@ -434,9 +434,9 @@ func TestBuildSelectQueryPartitionWindows(t *testing.T) {
 	// inclusive end (the last window must not drop the boundary row)
 	q = buildSelectQuery(DialectGoogleSQL, "Deposits", cols, source.ReadOptions{
 		ExtractPartitionBy:           "DepositedAt",
-		ExtractPartitionStart:         &start,
-		ExtractPartitionEnd:           &end,
-		ExtractPartitionEndInclusive:  true,
+		ExtractPartitionStart:        &start,
+		ExtractPartitionEnd:          &end,
+		ExtractPartitionEndInclusive: true,
 	})
 	if !strings.Contains(q, "`DepositedAt` <= TIMESTAMP") {
 		t.Fatalf("inclusive end must use <=: %s", q)
@@ -976,7 +976,7 @@ func TestMergeDeclaredLengths(t *testing.T) {
 	// from information_schema. Regression for the freeze failure that twice
 	// killed the staging copy ("type change from string to string").
 	queryCols := []schema.Column{
-		{Name: "Title", DataType: schema.TypeString},              // no length
+		{Name: "Title", DataType: schema.TypeString}, // no length
 		{Name: "TeamNames", DataType: schema.TypeArray, ArrayType: schema.TypeString},
 		{Name: "Ghost"}, // not in information_schema: untouched
 	}
@@ -999,4 +999,29 @@ func TestMergeDeclaredLengths(t *testing.T) {
 	if queryCols[0].MaxLength != 0 {
 		t.Error("input must not be mutated")
 	}
+}
+
+// mergeDeclaredLengths returns make([]schema.Column, len(queryCols)), which is
+// a NON-NIL empty slice when queryCols is empty. Callers must therefore test
+// len(...) == 0 rather than == nil when deciding whether to fall back to the
+// INFORMATION_SCHEMA columns — an empty table produces exactly that shape, and
+// a nil test silently leaves the table with no columns at all.
+func TestMergeDeclaredLengthsOnEmptyQueryColumnsIsNonNil(t *testing.T) {
+	info := []schema.Column{
+		{Name: "id", DataType: schema.TypeString},
+		{Name: "user_id", DataType: schema.TypeString},
+	}
+
+	got := mergeDeclaredLengths(nil, info)
+
+	assert.NotNil(t, got, "returned slice must be non-nil; a nil test downstream would be misleading")
+	assert.Empty(t, got, "the merge drops info columns entirely, which is the hazard the caller guards against")
+	assert.NotEmpty(t, info, "sanity: the info columns were real")
+
+	// And the behaviour the caller depends on: the merge preserves lengths on a
+	// non-empty base rather than adding columns.
+	base := []schema.Column{{Name: "id", DataType: schema.TypeString, MaxLength: 0}}
+	merged := mergeDeclaredLengths(base, []schema.Column{{Name: "id", MaxLength: 36}})
+	assert.Len(t, merged, 1)
+	assert.Equal(t, 36, merged[0].MaxLength)
 }
